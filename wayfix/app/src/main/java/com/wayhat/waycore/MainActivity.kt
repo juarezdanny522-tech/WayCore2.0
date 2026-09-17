@@ -149,7 +149,7 @@ class MainActivity : ComponentActivity() {
                         OutlinedTextField(
                             value = modelDraft, onValueChange = { modelDraft = it },
                             modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
-                            label = { Text("Modelo (opcional): ${GeminiClient.models(this).joinToString(" o ")}") },
+                            label = { Text("Modelo (opcional): ${GeminiClient.models(this@MainActivity).joinToString(" o ")}") },
                             singleLine = true
                         )
                         Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
