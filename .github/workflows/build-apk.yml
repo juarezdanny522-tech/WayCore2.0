@@ -1,14 +1,18 @@
-# Genera el APK de WayCore en cada push a main (o manualmente desde la
-# pestaña Actions -> "Build APK" -> Run workflow).
+# Genera el APK de WayCore cuando se abre/actualiza un PR a main, en cada
+# push a main, o manualmente (Actions -> Build APK -> Run workflow).
 #
-# El APK queda en dos lugares:
-#   1. En un Release de GitHub (etiqueta apk-<commit>) con el botón de descarga.
-#   2. Como artifact de la corrida (90 días).
+# El APK queda en:
+#   1. Artifact "waycore-apk" de la corrida (cualquier trigger; 90 días).
+#   2. Además, en push a main o manual: un Release de GitHub
+#      (etiqueta apk-<commit>) con el botón de descarga directa.
 name: Build APK
 
 on:
   workflow_dispatch:
   push:
+    branches:
+      - main
+  pull_request:
     branches:
       - main
 
@@ -51,7 +55,10 @@ jobs:
           path: wayfix/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 
+      # En PRs el token es de solo lectura, así que el Release se publica
+      # solo en push a main / workflow_dispatch.
       - name: Publish GitHub Release con el APK
+        if: github.event_name != 'pull_request'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
