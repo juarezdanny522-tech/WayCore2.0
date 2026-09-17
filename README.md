@@ -1,5 +1,7 @@
 # WayCore 2.0
 
+**Versión de la app:** 0.7.0 (versionCode 8). **Firmware:** WayHat v6.1.
+
 App de Android + firmware ESP32 para el sombrero WayHat: avisos de proximidad por voz
 para personas con discapacidad visual.
 
