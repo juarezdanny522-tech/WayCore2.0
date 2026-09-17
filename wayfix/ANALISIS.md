@@ -75,3 +75,79 @@ Revisión de las 16 rutas del repo (app Android en Kotlin/Compose + sketch ESP32
   CI sea instalable. Con keystore propia, el release usa esa firma.
 - Si falta el wrapper de Gradle: `gradle wrapper --gradle-version 8.11.1` dentro de `wayfix/`.
   `gradle/wrapper/gradle-wrapper.properties` ya fija la versión 8.11.1.
+
+---
+
+# Fase 2 — cerebro local con function calling
+
+## Qué se montó
+
+| Pieza | Archivo | Para qué |
+|---|---|---|
+| Catálogo y descarga | `ModelManager.kt` | tabla `SPECS` con tamaños y SHA‑256 reales de Hugging Face, descarga reanudable con `Range`, verificación, borrado |
+| Motor de inferencia | `LocalBrain.kt` | `Engine` con GPU→CPU de respaldo, conversación nueva por pregunta, streaming, `cancelGeneration`, `unload` |
+| Protocolo de herramientas | `LocalToolCalling.kt` | prompt + parser determinista, normalización de alias, límites, guard "¿la persona lo pidió?" |
+| Descarga en segundo plano | `ModelTransferService.kt` | servicio `dataSync`, notificación con progreso y porcentaje hablado |
+| Enrutado y voz | `KarbysService.kt` | LOCAL/AUTO/NUBE, habla por frases, barge‑in de seguridad, confirmación con estado real |
+| Control | `MainActivity.kt` | sección CEREBRO: modo, versión del modelo, progreso, GPU, avisos hablados |
+| Prueba | `app/src/test/.../ToolProtocolTest.kt` | 22 casos del parser, ejecutados por CI antes de empaquetar |
+
+## Datos verificados antes de escribir el código
+
+Tamaños y huellas tomados del árbol real de `Qwen/Qwen2.5-1.5B-Instruct-GGUF` (el `lfs.oid` de
+la API es el SHA‑256 del archivo), no de memoria:
+
+| Cuantización | Bytes | RAM mínima |
+|---|---|---|
+| q4_k_m (por defecto) | 1 117 320 736 | 3600 MB |
+| q3_k_m | 924 455 968 | 3200 MB |
+| q2_k | 752 880 160 | 2900 MB |
+| 0.5B q4_k_m (respaldo) | 491 400 032 | 2500 MB |
+
+Y las firmas reales de LiteRT‑LM (`Engine`, `EngineConfig`, `ConversationConfig`,
+`SamplerConfig`, `sendMessageAsync(...): Flow<Message>`, `Conversation : AutoCloseable`) sacadas
+del código de `google-ai-edge/LiteRT-LM`, no de un tutorial.
+
+## Errores que aparecieron al probar (y por qué importan)
+
+El parser se validó con un espejo ejecutable del algoritmo antes de compilar. Salió con fallos
+reales, tres de ellos habrían pasado a producción:
+
+1. **`set_wayhat_sensitivity` no se reconocía nunca.** La regla buscaba `sensib` y el nombre
+   inglés es `sensitivity` (`sensit`). Consecuencia: la orden estrella —cambiar la
+   sensibilidad— habría quedado muerta para siempre, en silencio.
+2. **El marcador a mitad de línea no se quitaba.** "Voy a cambiarlo. ACCIÓN: {…}" dejaba
+   `ACCIÓN:` en el texto hablado. Los anclajes `^` había que soltarlos.
+3. **El arranque del streaming no distinguía orden de respuesta.** Con 24 caracteres de
+   adelanto un JSON *incompleto* no tiene la llave cerrada, así que el detector decía "es
+   prosa" y el teléfono se ponía a leer `{"name":"set_wa…` en voz alta. Ahora también cuenta
+   empezar por `{` o `[`.
+4. Menor: `prefs.putInt` para un tamaño de 1.1 GB (se leía negativo), y `data class` con
+   `private` a nivel de archivo.
+
+Y uno de diseño que la prueba forzó a explicitar: un JSON *mal formado* o una herramienta
+prohibida no puede leerse tal cual; ahora la línea se descarta entera.
+
+## Lo que queda pendiente de confirmar en un teléfono real
+
+- Que `latest.release` de `litertlm-android` exponga exactamente los parámetros usados
+  (`maxOutputToken` en `ConversationConfig` es el candidato a mover a `sendMessageAsync` si el
+  AAR publicado no lo tiene). La prueba es el build de la acción: si falla, el error aparece en
+  `apk/build-debug-errors.txt`.
+- Velocidad real de generación y RAM libre en el modelo concreto del usuario. Con 3 GB la
+  opción es q2_k, no q4_k_m.
+- Que OpenCL no reviente en el Adreno/Mali del teléfono: si `Usar GPU` falla, `LocalBrain` ya
+  reintenta en CPU, pero conviene medir cuánto tarda cada camino.
+- El firmware `WayHat_v6_WayCore.ino` ya devuelve en el *ack* el estado aplicado
+  (`threshold`/`mode`/`buzzer`); la confirmación hablada sale de ahí. Si una versión anterior
+  del sketch no manda ese ack, Karbys dice "hecho" a secas en vez de inventar cifras.
+
+## Decisiones que se mantuvieron a propósito
+
+- El APK sigue sin llevar el modelo dentro: 1.1 GB en la tienda no es razonable para una app de
+  accesibilidad que se instala por enlace.
+- Gemini no se borra: queda como respaldo (modo NUBE y AUTO sin modelo). La clave sigue sin
+  embeberse en el repo público.
+- Conversation nueva por pregunta en vez de historial vivo del runtime: la memoria son 4 turnos
+  en Kotlin y el contexto del sombrero se reinyerta fresco cada vez, para que el modelo nunca
+  razone sobre telemetría vieja.

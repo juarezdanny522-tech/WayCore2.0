@@ -143,3 +143,71 @@ Reglas que no se pueden romper:
 | Temperatura siempre "sin lectura" | El DHT11 es de 1 Hz y necesita ~1 s entre lecturas; el firmware ya lo respeta. Revisa el pull-up de 10 kΩ en el pin de datos. |
 | Distancias locas en los HC-SR04 | Ecos cruzados entre sensores. El firmware separa 6 ms cada lectura; si sigues viendo saltos, aumenta `HC_GAP_MS` o cambia el orden. Ojo: el ECHO del HC-SR04 es 5 V, un divisor de voltaje evita quemar el pin. |
 | El teléfono no vibra cerca de obstáculos | El teléfono solo vibra en modo SAFE. El buzzer del sombrero es la alerta primaria. |
+
+## Cerebro local (funciona sin Internet y sin clave)
+
+Karbys ya no depende de Gemini para pensar. Puede correr un modelo en el propio teléfono con
+LiteRT‑LM (el motor de Google, llama.cpp por dentro) usando un GGUF de **Qwen2.5‑1.5B**.
+
+Se eligió 1.5B en vez de 0.5B porque el de 1.5B sí sostiene *function calling*: puede decidir
+y ejecutar acciones en el sombrero. El modelo **no va dentro del APK** (pesaría más de 1 GB);
+se descarga al teléfono desde Hugging Face y se verifica con su huella SHA‑256.
+
+Cómo se monta, en el orden que hay que hacerlo:
+
+1. Instalar el APK y abrir WayCore.
+2. Bajar hasta **CEREBRO DE KARBYS** y tocar **DESCARGAR IA**. Pesa ~1066 MB (q4_k_m) y tarda
+   varios minutos; la app sigue bajando con la pantalla apagada y Karbys va dictando el
+   porcentaje ("voy al 25 por ciento"). Si se corta, reanuda donde quedó (HTTP Range).
+3. Cuando dice "listo", elegir **LOCAL** (o dejar **AUTO**: usa el modelo si está descargado y
+   si no, Gemini). **NUBE** fuerza la nube aunque el modelo esté.
+4. Probar con **PROBAR EL CEREBRO**. La primera pregunta tarda ~10 s porque hay que cargar el
+   modelo en memoria; después responde en 2–4 s y todo sigue funcionando sin avión modo.
+
+Qué se puede decirle (el modelo responde en español, sin Markdown, pensado para oírse):
+
+| Frase | Qué pasa |
+|---|---|
+| "baja la sensibilidad a 60 centímetros" | cambia el umbral del sombrero y confirma con el valor real que devolvió el ESP32 |
+| "pon modo seguro" / "cambia a modo charla" | SAFE deja solo las alertas; CHAT añade la voz continua |
+| "apaga los avisos" / "activa los avisos" | silencia o reactiva buzzer y vibra del sombrero |
+| "prueba el zumbador" | hace sonar el buzzer una vez para confirmar que el enlace vive |
+| "¿qué marcan los sensores?" | lee telemetría fresca, no la cacheada |
+| "¿a qué distancia está?" / "¿cómo vas?" | respuesta hablada con los números reales del momento |
+
+Detalles que importan cuando no se puede mirar la pantalla:
+
+- Mientras el modelo escribe, Karbys **habla por frases**: no hay que esperar a que termine.
+- Si el sombrero detecta un obstáculo serio mientras está hablando, **corta lo que estaba
+  diciendo y avisa primero**; la generación del modelo se cancela en ese momento.
+- El porcentaje de la descarga se dicta cada 25 puntos, sin repetir.
+- La confirmación de una acción se arma con lo que respondió el hardware, no con lo que el
+  modelo imaginó: si el ESP32 no contestó, Karbys lo dice en vez de inventar.
+
+Cómo se conecta el modelo con el sombrero (para quien quiera tocarlo):
+
+El runtime tiene una API de tools, pero en modelos de 1.5B es frágil y no se puede verificar en
+un build de CI sin teléfono. En su lugar hay un protocolo propio y determinista en
+`LocalToolCalling.kt`: el *system prompt* declara cinco herramientas y exige una línea
+`ACCIÓN: {"name":"…","args":{…}}` o `DECIR:` para hablar. El parser:
+
+- busca objetos JSON balanceados (respetando comillas y escapes) aunque el modelo los mezcle
+  con prosa, los escriba en varias líneas o los meta entre ```json;
+- acepta alias y unidades sucias: `sensibilidad`, `sensitivity`, `"80 centímetros"`, `SEGURO`,
+  `avisos: "sí"`;
+- tira lo que no esté en la lista blanca o salga del rango 20–150 cm, **y ese texto nunca se
+  lee en voz alta** (una persona ciega no gana nada escuchando llaves y comillas);
+- ejecuta, vuelve a preguntar con el estado fresco y ahí sí habla la confirmación (máximo
+  tres rondas);
+- **no toca el hardware si la persona no lo pidió**: si el modelo alucina una orden durante una
+  pregunta normal, se descarta y se avisa en pantalla. Las lecturas sí se permiten.
+
+`app/src/test/java/.../ToolProtocolTest.kt` prueba todo eso (22 casos) y la acción de GitHub los
+corre antes de empaquetar; el resumen sale en `apk/test-summary.txt` de la rama de artefactos.
+
+Requisitos del teléfono: 4 GB de RAM o más para q4_k_m (con 3 GB se puede probar q3_k_m o
+q2_k con **OTRA VERSIÓN DEL MODELO**). Con menos, la app lo dice y no intenta cargarlo: en un
+dispositivo que guía a alguien cruzando la calle, quedarse sin memoria a media generación es
+peor que no tener cerebro local. El selector **Usar GPU** intenta OpenCL y cae solo a CPU si
+ese teléfono no puede.
+

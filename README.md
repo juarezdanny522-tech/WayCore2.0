@@ -17,3 +17,9 @@ para personas con discapacidad visual.
 
 WayHat sigue protegiendo (buzzer y sensores) aunque el teléfono se quede sin Internet o sin
 Gemini.
+
+**Fase 2 (nuevo):** Karbys puede pensar dentro del teléfono, sin Internet y sin clave de API,
+con un Qwen2.5‑1.5B en GGUF que se descarga desde la propia app. Además entiende órdenes que
+actúan sobre el sombrero (sensibilidad, modo, avisos, prueba de zumbador, leer sensores) y
+habla la confirmación con el estado real que devolvió el ESP32. Detalles y forma de montarlo:
+[`wayfix/README.md`](wayfix/README.md#cerebro-local-funciona-sin-internet-y-sin-clave).

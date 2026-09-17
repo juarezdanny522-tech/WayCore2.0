@@ -46,6 +46,16 @@ android {
         versionCode = 7
         versionName = "0.6.0"
         buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
+
+        // El motor de IA local trae librerías nativas por arquitectura. Sin este filtro el
+        // APK arrastraría también la variante de emulador x86. Para probar en emulador,
+        // añadir "x86_64" a la lista o compilar con -PABI=x86_64.
+        ndk {
+            val wanted = providers.gradleProperty("ABI").orNull
+                ?: System.getenv("WAYCORE_ABI")
+                ?: "arm64-v8a,armeabi-v7a"
+            abiFilters += wanted.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        }
     }
 
     buildTypes {
@@ -89,6 +99,13 @@ android {
 
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        // litert y litertlm empaquetan el mismo .so de OpenCL; sin esto la Fusión de
+        // librerías nativas falla con "2 files found with path".
+        jniLibs.pickFirsts += "**/libLiteRtClGlAccelerator.so"
+    }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
     }
 }
 
@@ -102,6 +119,13 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // Motor de inferencia local (llama.cpp por dentro) para el GGUF de Qwen.
+    implementation("com.google.ai.edge.litertlm:litertlm-android:latest.release")
+
+    testImplementation("junit:junit:4.13.2")
+    // En las pruebas de JVM org.json no viene del framework de Android.
+    testImplementation("org.json:json:20240303")
     // org.json no se agrega como librería: el framework de Android ya la provee.
     // androidx.work tampoco: WayCore usa AlarmManager, no WorkManager.
 }

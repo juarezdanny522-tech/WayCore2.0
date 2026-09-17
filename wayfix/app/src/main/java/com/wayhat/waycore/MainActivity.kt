@@ -20,10 +20,16 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
+    private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var ready by mutableStateOf(false)
     private var paused by mutableStateOf(false)
     private var wayHatConnected by mutableStateOf(false)
@@ -45,6 +51,15 @@ class MainActivity : ComponentActivity() {
     private var keyConfigured by mutableStateOf(false)
     private var keyDraft by mutableStateOf("")
     private var modelDraft by mutableStateOf("")
+    private var brainMode by mutableStateOf(Prefs.BRAIN_AUTO)
+    private var modelReady by mutableStateOf(false)
+    private var modelLabel by mutableStateOf("")
+    private var quantLabel by mutableStateOf("")
+    private var modelPercent by mutableStateOf(0f)
+    private var downloading by mutableStateOf(false)
+    private var gpuPref by mutableStateOf(false)
+    private var voiceAlertPref by mutableStateOf(true)
+    private var deviceNote by mutableStateOf("")
 
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
         val mic = result[Manifest.permission.RECORD_AUDIO] == true || has(Manifest.permission.RECORD_AUDIO)
@@ -62,13 +77,23 @@ class MainActivity : ComponentActivity() {
                     intent.getStringExtra("telemetry")?.let { parseTelemetry(it) }
                 }
                 KarbysService.ACTION_UI -> intent.getStringExtra("message")?.let { lastKarbys = it }
+                ModelManager.ACTION_PROGRESS -> {
+                    val phase = intent.getStringExtra(ModelManager.EXTRA_PHASE).orEmpty()
+                    modelLabel = intent.getStringExtra(ModelManager.EXTRA_TEXT).orEmpty()
+                    modelPercent = intent.getIntExtra(ModelManager.EXTRA_PERCENT, 0) / 100f
+                    downloading = phase != "listo" && phase != "error"
+                    if (phase == "listo" || phase == "error") refreshModelStatus()
+                }
             }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val filter = IntentFilter(WayHatService.ACTION_STATUS).apply { addAction(KarbysService.ACTION_UI) }
+        val filter = IntentFilter(WayHatService.ACTION_STATUS).apply {
+            addAction(KarbysService.ACTION_UI)
+            addAction(ModelManager.ACTION_PROGRESS)
+        }
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         else registerReceiver(receiver, filter)
 
@@ -76,6 +101,7 @@ class MainActivity : ComponentActivity() {
         keyConfigured = Prefs.hasApiKey(this)
         keyDraft = ""
         modelDraft = Prefs.model(this)
+        refreshModelStatus()
 
         setContent {
             var prompt by remember { mutableStateOf("") }
@@ -156,6 +182,51 @@ class MainActivity : ComponentActivity() {
                             Button(onClick = { saveSettings() }, modifier = Modifier.weight(1f)) { Text("GUARDAR") }
                             Button(onClick = { send(KarbysService.ACTION_GREETING) }, modifier = Modifier.weight(1f)) { Text("SALUDAR") }
                         }
+
+                        HorizontalDivider(Modifier.padding(vertical = 18.dp))
+                        Text("CEREBRO DE KARBYS", style = MaterialTheme.typography.titleLarge)
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Button(onClick = { pickBrain(Prefs.BRAIN_LOCAL) }, modifier = Modifier.weight(1f)) { Text("LOCAL") }
+                            Button(onClick = { pickBrain(Prefs.BRAIN_AUTO) }, modifier = Modifier.weight(1f)) { Text("AUTO") }
+                            Button(onClick = { pickBrain(Prefs.BRAIN_CLOUD) }, modifier = Modifier.weight(1f)) { Text("NUBE") }
+                        }
+                        Text("Modo: ${brainLabel(brainMode)}")
+                        Text(quantLabel)
+                        Text(modelStatus())
+                        if (downloading) {
+                            LinearProgressIndicator(
+                                progress = { modelPercent },
+                                modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
+                            )
+                            if (modelLabel.isNotBlank()) Text(modelLabel)
+                        }
+                        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Button(onClick = { toggleDownload() }, modifier = Modifier.weight(1f)) {
+                                Text(if (downloading) "CANCELAR" else "DESCARGAR IA")
+                            }
+                            Button(onClick = { deleteModel() }, modifier = Modifier.weight(1f)) { Text("BORRAR") }
+                        }
+                        Button(onClick = { nextQuant() }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                            Text("OTRA VERSIÓN DEL MODELO")
+                        }
+                        Button(onClick = { sendText("preséntate en una frase corta") }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                            Text("PROBAR EL CEREBRO")
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Usar GPU")
+                            Spacer(Modifier.width(12.dp))
+                            Switch(checked = gpuPref, onCheckedChange = { gpuPref = it; Prefs.setUseGpu(this@MainActivity, it) })
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Avisarme los obstáculos con la voz")
+                            Spacer(Modifier.width(12.dp))
+                            Switch(
+                                checked = voiceAlertPref,
+                                onCheckedChange = { voiceAlertPref = it; Prefs.setVoiceAlerts(this@MainActivity, it) }
+                            )
+                        }
+                        Text("Teléfono: ${LocalBrain.deviceSummary()}")
+                        if (deviceNote.isNotBlank()) Text(deviceNote)
                     }
                 }
             }
@@ -167,9 +238,11 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         updateDeviceInfo()
         keyConfigured = Prefs.hasApiKey(this)
+        refreshModelStatus()
     }
 
     override fun onDestroy() {
+        uiScope.cancel()
         try { unregisterReceiver(receiver) } catch (_: Exception) { }
         super.onDestroy()
     }
@@ -178,6 +251,74 @@ class MainActivity : ComponentActivity() {
         Prefs.setApiKey(this, keyDraft.trim())
         Prefs.setModel(this, modelDraft.trim())
         keyConfigured = Prefs.hasApiKey(this)
+        deviceNote = ""
+    }
+
+    private fun pickBrain(mode: String) {
+        Prefs.setBrainMode(this, mode)
+        brainMode = mode
+    }
+
+    private fun brainLabel(mode: String): String = when (mode) {
+        Prefs.BRAIN_LOCAL -> "solo el modelo del teléfono, sin Internet"
+        Prefs.BRAIN_CLOUD -> "solo Gemini por Internet"
+        else -> "el teléfono si ya descargó el modelo, si no la nube"
+    }
+
+    private fun modelStatus(): String {
+        val file = ModelManager.modelFile(this)
+        val spec = ModelManager.specFor(this)
+        return when {
+            modelReady -> "Está en el teléfono: ${ModelManager.megabytes(file.length())} MB. Karbys piensa sin Internet."
+            downloading -> "Descargando el modelo, no cierres la app."
+            else -> "Falta descargar: ${spec.megabytes} MB. Hay ${ModelManager.freeMegabytes(this)} MB libres."
+        }
+    }
+
+    private fun toggleDownload() {
+        if (ModelTransferService.isBusy()) {
+            ModelTransferService.cancel(this)
+            downloading = false
+            return
+        }
+        if (!ModelManager.fitsOnThisPhone(this)) {
+            deviceNote = ModelManager.reasonItDoesNotFit(this)
+            return
+        }
+        deviceNote = ""
+        ModelTransferService.start(this)
+        downloading = true
+    }
+
+    private fun deleteModel() {
+        uiScope.launch {
+            ModelManager.deleteModel(this@MainActivity)
+            downloading = false
+            modelPercent = 0f
+            refreshModelStatus()
+        }
+    }
+
+    private fun nextQuant() {
+        val specs = ModelManager.SPECS
+        val index = specs.indexOfFirst { it.fileName == ModelManager.specFor(this).fileName }
+        val next = specs[((if (index < 0) 0 else index) + 1) % specs.size]
+        Prefs.selectQuantization(this, next.fileName, next.url)
+        refreshModelStatus()
+    }
+
+    private fun refreshModelStatus() {
+        val spec = ModelManager.specFor(this)
+        modelReady = ModelManager.isReady(this)
+        quantLabel = spec.label
+        brainMode = Prefs.brainMode(this)
+        gpuPref = Prefs.useGpu(this)
+        voiceAlertPref = Prefs.voiceAlerts(this)
+        downloading = ModelTransferService.isBusy()
+        val ram = ModelManager.totalRamMegabytes(this)
+        if (deviceNote.isBlank() && ram in 1 until spec.minRamMegabytes) {
+            deviceNote = "Ojo: este teléfono tiene $ram MB de memoria y el modelo pide unos ${spec.minRamMegabytes} MB."
+        }
     }
 
     private fun requestPermissionsIfNeeded() {

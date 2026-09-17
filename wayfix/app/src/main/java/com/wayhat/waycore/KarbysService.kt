@@ -29,13 +29,27 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
         const val ACTION_GREETING = "GREETING"
         const val ACTION_REMINDER = "REMINDER"
         const val ACTION_TEXT = "TEXT"
-        /** Aviso opcional para la interfaz: la app puede mostrar lo que Karbys está diciendo. */
+        /** Hablar un texto informativo (progreso de descarga, avisos del sistema). */
+        const val ACTION_SAY = "SAY"
+        /** Aviso de proximidad vindo de WayHat: interrumpe a Karbys. */
         const val ACTION_UI = "com.wayhat.waycore.UI"
         const val CHANNEL = "karbys_assistant"
         const val NOTIFICATION_ID = 2401
         private const val CONTINUATION_SILENCE_MS = 4500L
         private const val CONTINUATION_WINDOW_MS = 6000L
         private const val COMMAND_RETRY_DELAY_MS = 180L
+
+        /**
+         * Instrucción para el modelo local. Es mucho más corta que la de Gemini a propósito:
+         * cada token del system prompt es prefill, y el prefill es lo que hace sentir lento un
+         * modelo en el teléfono. Con 0.5B hay que pedir una sola cosa: respuestas de dos frases.
+         */
+        private const val LOCAL_SYSTEM =
+            "Eres Karbys, el asistente de una persona ciega que usa un sombrero con sensores. " +
+            "Hablas español latinoamericano natural y corto. Cuando hables, usa dos frases como máximo. " +
+            "Usa solo los datos reales que vienen en el mensaje y nunca inventes cifras: si un dato " +
+            "dice sin lectura o no aparece, di que no lo tienes. No uses markdown, listas, emojis ni " +
+            "comillas. WayCore se pronuncia guaycor y WayHat guayjat."
     }
 
     private var recognizer: SpeechRecognizer? = null
@@ -50,6 +64,13 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
     private var tone: ToneGenerator? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private val main = Handler(Looper.getMainLooper())
+    /** Fragmentos del modelo local que aún no se hablaron (se vacían por frase completa). */
+    private val pendingSpeech = StringBuilder()
+    private val speechPeek = StringBuilder()
+    private var speechDecided = false
+    private var speechSuppressed = false
+    private var streamedAny = false
+    @Volatile private var speechInterrupted = false
     private var continuationTimeout: Runnable? = null
     private var continuationDeadline = 0L
     private var recognizerGeneration = 0L
@@ -57,6 +78,31 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
     private var restartAllowedAt = 0L
     private var batteryReceiver: BroadcastReceiver? = null
     private lateinit var audioManager: AudioManager
+
+    /**
+     * WayHat avisa de un obstáculo mientras Karbys está hablando o generando: el aviso de
+     * seguridad manda. Se corta el TTS, se detiene la generación del modelo y se habla la
+     * distancia. Sin esto, el sombrero avisaría por buzzer mientras la voz tapa el entorno.
+     */
+    private val alertReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != WayHatService.ACTION_ALERT) return
+            if (!Prefs.voiceAlerts(this@KarbysService)) return
+            val cm = intent.getIntExtra("distance", -1)
+            val talking = ::tts.isInitialized && try { tts.isSpeaking } catch (_: Exception) { false }
+            if (!talking && !LocalBrain.generating) return
+            speechInterrupted = true
+            LocalBrain.cancelGeneration()
+            val phrase = if (cm > 0) "Cuidado, obstáculo a $cm centímetros." else "Cuidado, algo muy cerca."
+            if (::tts.isInitialized) {
+                try {
+                    tts.stop()
+                    tts.speak(phrase, TextToSpeech.QUEUE_FLUSH, null, "karbys-alert")
+                } catch (_: Exception) { }
+            }
+            publishUiEvent(phrase, true)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -91,6 +137,13 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
             acquire()
         }
         registerBatteryMonitor()
+        // Android 14 exige declarar que el receptor es privado; si se omite, el sistema lanza
+        // SecurityException y Karbys se queda sin el aviso de proximidad hablado.
+        try {
+            val alertFilter = IntentFilter(WayHatService.ACTION_ALERT)
+            if (Build.VERSION.SDK_INT >= 33) registerReceiver(alertReceiver, alertFilter, Context.RECEIVER_NOT_EXPORTED)
+            else registerReceiver(alertReceiver, alertFilter)
+        } catch (_: Exception) { }
         setupRecognizer()
     }
 
@@ -100,6 +153,10 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
             ACTION_STOP -> stopEverything(true)
             ACTION_SHUTDOWN -> { stopEverything(false); stopSelf() }
             ACTION_START -> startHotword()
+            ACTION_SAY -> {
+                val text = intent?.getStringExtra("text").orEmpty().trim()
+                if (text.isNotBlank()) main.post { speak(text) }
+            }
             ACTION_TEXT -> {
                 val text = intent?.getStringExtra("text").orEmpty().trim()
                 if (text.isNotBlank()) {
@@ -405,19 +462,287 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
 
     private fun askKarbys(text: String) {
         processing = true
+        speechInterrupted = false
         continuationDeadline = 0L
         val clean = text.trim()
         publishUiEvent("Escuché: $clean", false)
         scope.launch {
             val direct = executeLocalCommand(clean)
-            val answer = direct ?: GeminiClient.ask(this@KarbysService, clean, memory.toList(), buildDeviceContext())
-            memory.add(ConversationTurn(clean, answer))
-            while (memory.size > 4) memory.removeAt(0)
-            withContext(Dispatchers.Main) {
-                processing = false
-                speak(answer)
+            if (direct != null) {
+                rememberTurn(clean, direct)
+                withContext(Dispatchers.Main) { processing = false; speak(direct) }
+                return@launch
+            }
+            when {
+                shouldUseLocalBrain() -> speakLocally(clean)
+                Prefs.hasApiKey(this@KarbysService) -> speakWithGemini(clean)
+                else -> {
+                    val hint = if (ModelManager.isReady(this@KarbysService)) {
+                        "El cerebro local no está listo todavía y no hay clave de Gemini. Los comandos del sombrero sí funcionan: dime, por ejemplo, estado de WayHat."
+                    } else {
+                        "Ahora mismo no tengo cerebro conversacional. Descarga el modelo local en los ajustes de WayCore, que funciona sin Internet y sin clave, o guarda una clave de Gemini. Los comandos del sombrero sí funcionan."
+                    }
+                    withContext(Dispatchers.Main) { processing = false; speak(hint) }
+                }
             }
         }
+    }
+
+    /** AUTO y LOCAL usan el GGUF del teléfono cuando está descargado; CLOUD siempre va a Gemini. */
+    private fun shouldUseLocalBrain(): Boolean {
+        val mode = Prefs.brainMode(this)
+        val ready = ModelManager.isReady(this)
+        return when (mode) {
+            Prefs.BRAIN_CLOUD -> false
+            else -> ready
+        }
+    }
+
+    /**
+     * Conversa con el modelo del teléfono y, si el modelo lo pide, ejecuta acciones reales en
+     * WayHat antes de confirmar. El flujo es: generar → si hay ACCIÓN:, ejecutar y volver a
+     * generar con el estado fresco del hardware → hablar la confirmación.
+     *
+     * El texto se habla por frases conforme sale (streaming), pero el primer trozo se retiene
+     * hasta saber si era una orden o una respuesta: así jamás se lee un JSON en voz alta.
+     */
+    private suspend fun speakLocally(userText: String) {
+        val ctx = this
+        var prompt = localPrompt(userText)
+        var answer = ""
+        var failure: String? = null
+        val executed = StringBuilder()
+        withContext(Dispatchers.Main) { beepReady(); publishUiEvent("Pensando en el teléfono…", false) }
+
+        var round = 0
+        while (round < ToolProtocol.MAX_ROUNDS) {
+            round++
+            withContext(Dispatchers.Main) { resetSpeech() }
+            val collected = StringBuilder()
+            try {
+                LocalBrain.ask(ctx, prompt, ToolProtocol.systemPrompt(LOCAL_SYSTEM), Prefs.maxTokens(ctx)) { chunk ->
+                    withContext(Dispatchers.Main) {
+                        collected.append(chunk)
+                        feedLocalChunk(chunk)
+                    }
+                }
+            } catch (e: Throwable) {
+                failure = e.message ?: e.javaClass.simpleName
+                break
+            }
+
+            val (spoken, requested) = ToolProtocol.extract(collected.toString())
+            // Un modelo pequeño alucina herramientas. Antes de tocar el hardware se comprueba
+            // que la persona lo pidió; las lecturas no cuentan porque no cambian nada.
+            val calls = requested.filter {
+                ToolProtocol.readOnly(it.name) || ToolProtocol.userAsksForChange(userText)
+            }
+            if (calls.isEmpty()) {
+                if (requested.isNotEmpty()) {
+                    withContext(Dispatchers.Main) {
+                        suppressSpeech()
+                        publishUiEvent("El modelo quiso cambiar algo sin que lo pidieras; no lo apliqué.", true)
+                    }
+                    answer = spoken.ifBlank { "No cambio nada del sombrero si no me lo pides." }
+                    break
+                }
+                answer = spoken.ifBlank { collected.toString().trim() }
+                break
+            }
+
+            withContext(Dispatchers.Main) { suppressSpeech() }
+            publishUiEvent("Aplicando en el sombrero: ${calls.joinToString { ToolProtocol.describe(it) }}", false)
+            for (call in calls) {
+                val result = summarizeToolResult(WayHatService.executeTool(call.name, call.args))
+                executed.append(ToolProtocol.describe(call)).append(" -> ").append(result).append("; ")
+            }
+            if (round >= ToolProtocol.MAX_ROUNDS) {
+                answer = spoken.ifBlank { "Ya se lo apliqué al sombrero." }
+                break
+            }
+            prompt = ToolProtocol.followUp(userText, executed.toString().trim(), compactState())
+        }
+
+        var finalAnswer = answer.trim()
+        if (finalAnswer.isBlank() && failure == null) {
+            // Sin texto y sin excepción: el modelo se quedó en blanco o solo emitió la orden.
+            finalAnswer = if (executed.isNotBlank()) "Listo, ya lo apliqué al sombrero."
+            else "No pude armar una respuesta con el modelo del teléfono. Intenta más despacio o dime el comando directo."
+        }
+        if (finalAnswer.isBlank() && failure != null) {
+            LocalBrain.unload()
+            if (Prefs.hasApiKey(ctx)) {
+                withContext(Dispatchers.Main) { publishUiEvent("El cerebro local falló; paso a la nube…", false) }
+                speakWithGemini(userText)
+            } else {
+                withContext(Dispatchers.Main) { processing = false; speak("El cerebro local falló: $failure.") }
+            }
+            return
+        }
+
+        val memoryLine = if (executed.isBlank()) finalAnswer
+        else "$finalAnswer (recién ejecutado: ${executed.toString().trim().trimEnd(';')})"
+        rememberTurn(userText, memoryLine)
+        withContext(Dispatchers.Main) {
+            if (!speechInterrupted) finishStreamedSpeech(finalAnswer)
+            processing = false
+            if (streamedAny) awaitTtsIdle { beginContinuationWindow() }
+        }
+    }
+
+    /** El ack del ESP32 trae el estado real después de aplicar la orden: se lo pasamos tal cual. */
+    private fun summarizeToolResult(raw: String): String {
+        val obj = try { JSONObject(raw) } catch (_: Exception) { null } ?: return raw.take(140)
+        if (!obj.has("ok")) return raw.take(140)
+        if (!obj.optBoolean("ok", false)) return obj.optString("message", "WayHat no aceptó la orden").ifBlank { "WayHat no aceptó la orden" }
+        val parts = listOfNotNull(
+            if (obj.has("threshold")) "sensibilidad ${obj.optInt("threshold")} cm" else null,
+            if (obj.has("mode")) "modo ${obj.optString("mode")}" else null,
+            if (obj.has("buzzer")) "avisos " + if (obj.optBoolean("buzzer")) "activos" else "apagados" else null
+        )
+        return if (parts.isEmpty()) "hecho" else "hecho, ${parts.joinToString(", ")}"
+    }
+
+    private fun resetSpeech() {
+        speechDecided = false
+        speechSuppressed = false
+        streamedAny = false
+        speechPeek.setLength(0)
+        pendingSpeech.setLength(0)
+    }
+
+    private fun suppressSpeech() {
+        speechSuppressed = true
+        speechPeek.setLength(0)
+        pendingSpeech.setLength(0)
+    }
+
+    private fun feedLocalChunk(chunk: String) {
+        if (speechSuppressed) return
+        if (!speechDecided) {
+            speechPeek.append(chunk)
+            val peeked = speechPeek.toString()
+            if (!peeked.contains('\n') && peeked.length < 24) return
+            speechDecided = true
+            if (ToolProtocol.looksLikeToolLine(peeked)) {
+                suppressSpeech()
+                return
+            }
+            pendingSpeech.append(peeked)
+            speechPeek.setLength(0)
+            flushPendingSpeech(force = false)
+            return
+        }
+        pendingSpeech.append(chunk)
+        flushPendingSpeech(force = false)
+    }
+
+    private fun finishStreamedSpeech(fullText: String) {
+        if (!speechDecided && speechPeek.isNotEmpty()) {
+            pendingSpeech.append(speechPeek.toString())
+            speechPeek.setLength(0)
+        }
+        if (streamedAny) flushPendingSpeech(force = true)
+        else if (fullText.isNotBlank()) speak(fullText)
+    }
+
+    private suspend fun speakWithGemini(userText: String) {
+        val answer = GeminiClient.ask(this, userText, memory.toList(), buildDeviceContext())
+        rememberTurn(userText, answer)
+        withContext(Dispatchers.Main) {
+            processing = false
+            speak(answer)
+        }
+    }
+
+    private fun rememberTurn(user: String, answer: String) {
+        memory.add(ConversationTurn(user, answer))
+        while (memory.size > 4) memory.removeAt(0)
+    }
+
+    /** Cola las frases ya completas del stream. Se llama solo en el hilo principal. */
+    private fun flushPendingSpeech(force: Boolean) {
+        if (!::tts.isInitialized) return
+        while (true) {
+            val text = pendingSpeech.toString()
+            if (text.isBlank()) { pendingSpeech.setLength(0); return }
+            val cut = sentenceEnd(text)
+            if (cut < 0) {
+                if (!force) return
+                pendingSpeech.setLength(0)
+                queueUtterance(text.trim())
+                return
+            }
+            pendingSpeech.setLength(0)
+            pendingSpeech.append(text.substring(cut))
+            queueUtterance(text.substring(0, cut).trim())
+        }
+    }
+
+    /** Final de frase después de al menos 12 caracteres, para no hablar fragmentos de dos palabras. */
+    private fun sentenceEnd(text: String): Int {
+        for (i in text.indices) {
+            val c = text[i]
+            val terminated = c == '.' || c == '!' || c == '?' || c == ':' || c == '\n'
+            if (!terminated || i < 12) continue
+            if (i == text.length - 1 || text[i + 1] == ' ' || text[i + 1] == '\n') return i + 1
+        }
+        return -1
+    }
+
+    private fun queueUtterance(piece: String) {
+        if (piece.isBlank()) return
+        streamedAny = true
+        val spoken = piece.replace("WayCore", "guaycor", ignoreCase = true)
+            .replace("WayHat", "guayjat", ignoreCase = true)
+            .replace("WayCorp", "guaycorp", ignoreCase = true)
+        routeToHeadsetIfPossible()
+        try { tts.speak(spoken, TextToSpeech.QUEUE_ADD, null, "karbys-chunk") } catch (_: Exception) { }
+    }
+
+    private fun awaitTtsIdle(after: () -> Unit) {
+        val started = System.currentTimeMillis()
+        main.postDelayed(object : Runnable {
+            override fun run() {
+                val speaking = ::tts.isInitialized && try { tts.isSpeaking } catch (_: Exception) { false }
+                if (speaking && System.currentTimeMillis() - started < 90_000L) main.postDelayed(this, 350)
+                else after()
+            }
+        }, 400)
+    }
+
+    /** Prompt compacto: menos tokens de prefill = menos segundos antes de la primera palabra. */
+    private fun localPrompt(userText: String): String {
+        val history = memory.takeLast(2).joinToString("\n") { "Usuario: ${it.user} Karbys: ${it.assistant}" }
+        return buildString {
+            appendLine("DATOS REALES AHORA: ${compactState()}")
+            if (history.isNotBlank()) appendLine("CONVERSACION ANTERIOR: $history")
+            appendLine("PREGUNTA: $userText")
+            append("RESPUESTA HABLADA:")
+        }
+    }
+
+    private fun compactState(): String {
+        val battery = run {
+            val info = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val level = info?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = info?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+            if (level >= 0 && scale > 0) level * 100 / scale else -1
+        }
+        val clock = SimpleDateFormat("H:mm", Locale.ROOT).format(Date())
+        val hardware = try {
+            val t = JSONObject(WayHatService.telemetrySnapshot())
+            if (!t.optBoolean("available", false)) "WayHat desconectado"
+            else {
+                fun reading(key: String) = t.optInt(key, -1).let { if (it > 0) "$it cm" else "sin lectura" }
+                "sensores frente ${reading("tf")}, derecha ${reading("right")}, izquierda ${reading("left")}, atras ${reading("rear")}; " +
+                    "obstaculo mas cercano ${reading("closest")}; modo ${t.optString("mode", "SAFE")}; " +
+                    "sensibilidad ${t.optInt("threshold", 50)} cm; " +
+                    "avisos ${if (t.optBoolean("buzzer", true)) "activos" else "apagados"}; " +
+                    (t.opt("temp") as? Number)?.let { "temperatura $it grados, " } ?: ""
+            }
+        } catch (_: Exception) { "WayHat sin datos" }
+        return "$hardware; bateria $battery%; hora $clock"
     }
 
     private suspend fun executeLocalCommand(text: String): String? {
@@ -675,6 +1000,9 @@ Un valor -1 o null en distancias significa que ese sensor no obtuvo lectura, no 
 
     override fun onDestroy() {
         batteryReceiver?.let { try { unregisterReceiver(it) } catch (_: Exception) {} }
+        try { unregisterReceiver(alertReceiver) } catch (_: Exception) {}
+        LocalBrain.cancelGeneration()
+        LocalBrain.unload()
         destroyRecognizer()
         if (::tts.isInitialized) tts.shutdown()
         tone?.release(); tone = null

@@ -84,6 +84,35 @@ jobs:
             echo "Sin clave embebida: se pedirá dentro de la app."
           fi
 
+      # Lógica pura (protocolo de herramientas del cerebro local y parser de recordatorios).
+      # No bloquea el APK: si un test falla se sube el reporte y el build sigue, para que un
+      # detalle de prueba no deje a nadie sin app ese día.
+      - name: Probar la lógica del protocolo (JUnit)
+        working-directory: wayfix
+        run: |
+          gradle $GRADLE_FLAGS testDebugUnitTest 2>&1 | tee /tmp/build-test.log || true
+          python3 - <<'PY' > /tmp/test-summary.txt 2>&1 || true
+          import glob, xml.etree.ElementTree as ET
+          files = glob.glob('app/build/test-results/testDebugUnitTest/*.xml')
+          tot = fail = err = skip = 0
+          msgs = []
+          for f in files:
+              r = ET.parse(f).getroot()
+              tot += int(r.get('tests', 0)); fail += int(r.get('failures', 0))
+              err += int(r.get('errors', 0)); skip += int(r.get('skipped', 0))
+              for tc in r.iter('testcase'):
+                  for tag in ('failure', 'error'):
+                      for n in tc.findall(tag):
+                          msgs.append('[%s] %s > %s\n%s\n%s' % (
+                              tag, (tc.get('classname') or '')[-40:], tc.get('name'),
+                              (n.get('message') or '')[:400], (n.text or '')[:1200]))
+          print('tests=%d failures=%d errors=%d skipped=%d reportes=%d' % (tot, fail, err, skip, len(files)))
+          for m in msgs[:30]:
+              print(m)
+          PY
+          echo "--- resumen de pruebas ---"
+          head -60 /tmp/test-summary.txt || true
+
       - name: Compilar APK de prueba
         working-directory: wayfix
         run: gradle $GRADLE_FLAGS assembleDebug 2>&1 | tee /tmp/build-debug.log
@@ -148,7 +177,8 @@ jobs:
           mkdir -p apk
           rm -rf apk/*
           if [ -f "$APK_DEBUG" ]; then cp "$APK_DEBUG" apk/WayCore-debug.apk; fi
-          for l in /tmp/build-debug.log /tmp/build-release.log; do
+          [ -f /tmp/test-summary.txt ] && cp /tmp/test-summary.txt apk/test-summary.txt
+          for l in /tmp/build-debug.log /tmp/build-release.log /tmp/build-test.log; do
             [ -f "$l" ] || continue
             base="$(basename "$l" .log)"
             grep -nE "^(e: |w: file.*/com/wayhat|.*: error:|> Task .*FAILED|FAILURE: |Caused by: |\* What went wrong|\* Where)" -A 4 "$l" \
@@ -171,5 +201,8 @@ jobs:
             echo "### APK de WayCore"
             echo "- Rama: \`${GITHUB_REF_NAME}\` · commit \`${GITHUB_SHA:0:7}\`"
             echo "- Release rolling: https://github.com/${GITHUB_REPOSITORY}/releases/tag/waycore-latest"
+            if [ -f /tmp/test-summary.txt ]; then
+              echo "- Pruebas unitarias: $(head -1 /tmp/test-summary.txt)"
+            fi
             echo "- El debug APK se instala directo; el release APK está firmado con la debug key porque el repo no tiene keystore propia."
           } >> "$GITHUB_STEP_SUMMARY"

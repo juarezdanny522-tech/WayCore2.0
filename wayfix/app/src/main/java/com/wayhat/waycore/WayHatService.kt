@@ -36,6 +36,8 @@ class WayHatService : Service() {
         const val ACTION_STOP = "com.wayhat.waycore.WAYHAT_STOP"
         const val ACTION_COMMAND = "com.wayhat.waycore.WAYHAT_COMMAND"
         const val ACTION_STATUS = "com.wayhat.waycore.WAYHAT_STATUS"
+        /** Peligro detectado: Karbys interrumpe lo que esté diciendo para avisar. */
+        const val ACTION_ALERT = "com.wayhat.waycore.PROXIMITY_ALERT"
         const val EXTRA_COMMAND = "command"
         const val EXTRA_JSON = "json"
         const val DEVICE_NAME = "WayHat-Karbys"
@@ -64,6 +66,7 @@ class WayHatService : Service() {
     private val pendingAcks = ConcurrentHashMap<String, CompletableDeferred<String>>()
     private lateinit var vibrator: Vibrator
     private var lastVibrationAt = 0L
+    private var lastVoiceAlertAt = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -234,6 +237,15 @@ class WayHatService : Service() {
         try {
             vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
         } catch (_: Exception) { }
+
+        // Aviso hablado como refuerzo del buzzer, con su propio ritmo más lento para no
+        // cortar la conversación cada medio metro.
+        if (now - lastVoiceAlertAt >= 4000L) {
+            lastVoiceAlertAt = now
+            try {
+                sendBroadcast(Intent(ACTION_ALERT).setPackage(packageName).putExtra("distance", dangerDistance))
+            } catch (_: Exception) { }
+        }
     }
 
     private fun sendJson(json: String) {
