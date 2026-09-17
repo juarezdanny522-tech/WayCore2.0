@@ -48,17 +48,6 @@ android {
         buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
     }
 
-    if (hasKeystore) {
-        signingConfigs {
-            create("wayhat") {
-                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
-                storePassword = keystoreProps.getProperty("storePassword")
-                keyAlias = keystoreProps.getProperty("keyAlias")
-                keyPassword = keystoreProps.getProperty("keyPassword")
-            }
-        }
-    }
-
     buildTypes {
         getByName("debug") {
             versionNameSuffix = "-debug"
@@ -66,7 +55,12 @@ android {
         getByName("release") {
             isMinifyEnabled = false
             signingConfig = if (hasKeystore) {
-                signingConfigs.getByName("wayhat")
+                signingConfigs.create("wayhat") {
+                    storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
+                    storePassword = keystoreProps.getProperty("storePassword")
+                    keyAlias = keystoreProps.getProperty("keyAlias")
+                    keyPassword = keystoreProps.getProperty("keyPassword")
+                }
             } else {
                 signingConfigs.getByName("debug")
             }

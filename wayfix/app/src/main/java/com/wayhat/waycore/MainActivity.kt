@@ -82,7 +82,9 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 Surface(Modifier.fillMaxSize()) {
                     Column(
-                        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
+                        // safeDrawingPadding: en Android 15 el contenido target 35 se dibuja
+                        // bajo la barra de estado; sin esto el primer texto queda tapado.
+                        Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text("WAYCORE", style = MaterialTheme.typography.headlineMedium)

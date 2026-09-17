@@ -43,10 +43,10 @@ jobs:
 
     steps:
       - name: Descargar el código
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Instalar Java 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -55,7 +55,6 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
-          cache-read-only: ${{ github.ref_name != github.event.repository.default_branch }}
 
       - name: Instalar Android SDK 35
         uses: android-actions/setup-android@v3
@@ -87,12 +86,12 @@ jobs:
 
       - name: Compilar APK de prueba
         working-directory: wayfix
-        run: gradle $GRADLE_FLAGS assembleDebug
+        run: gradle $GRADLE_FLAGS assembleDebug 2>&1 | tee /tmp/build-debug.log
 
       - name: Compilar APK release
         if: ${{ github.event.inputs.build_release != 'false' }}
         working-directory: wayfix
-        run: gradle $GRADLE_FLAGS assembleRelease
+        run: gradle $GRADLE_FLAGS assembleRelease 2>&1 | tee /tmp/build-release.log
 
       - name: Mostrar tamaño y firma de los APK
         run: |
@@ -136,22 +135,34 @@ jobs:
           gh release upload waycore-latest "${assets[@]}" --clobber
           echo "Descarga: https://github.com/${GITHUB_REPOSITORY}/releases/download/waycore-latest/WayCore-latest-debug.apk"
 
-      - name: Dejar el APK en arena/apk-artifacts
-        if: github.event_name == 'push' && startsWith(github.ref_name, 'arena/')
+      # Rama efímera para comunicar con el sandbox del agente: ahí deja el APK cuando
+      # compila, o el log del fallo cuando no (el log de Actions no se puede descargar
+      # desde el sandbox, la API de contenidos de GitHub sí).
+      - name: Dejar APK o log del fallo en arena/apk-artifacts
+        if: always() && github.event_name == 'push' && startsWith(github.ref_name, 'arena/')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
-          git switch --orphan apk-temporal
+          set -uo pipefail
+          git switch --orphan resultado || true
           mkdir -p apk
-          cp "$APK_DEBUG" apk/WayCore-debug.apk
+          rm -rf apk/*
+          if [ -f "$APK_DEBUG" ]; then cp "$APK_DEBUG" apk/WayCore-debug.apk; fi
+          for l in /tmp/build-debug.log /tmp/build-release.log; do
+            [ -f "$l" ] || continue
+            base="$(basename "$l" .log)"
+            grep -nE "^(e: |w: file.*/com/wayhat|.*: error:|> Task .*FAILED|FAILURE: |Caused by: |\* What went wrong|\* Where)" -A 4 "$l" \
+              | tail -260 > "apk/$base-errors.txt" || true
+            tail -c 300000 "$l" > "apk/$base-tail.txt" || true
+          done
+          echo "commit: $GITHUB_SHA / $(date -u +%FT%TZ)" > apk/estado.txt
+          [ -f apk/WayCore-debug.apk ] && echo "apk: si" >> apk/estado.txt || echo "apk: no" >> apk/estado.txt
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -f apk/WayCore-debug.apk
-          git commit -q -m "apk: build $GITHUB_SHA"
+          git add -f apk
+          git commit -q -m "resultado: build $GITHUB_SHA" || exit 0
           git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
             HEAD:refs/heads/arena/apk-artifacts
-          echo "APK disponible en la rama arena/apk-artifacts (apk/WayCore-debug.apk)."
 
       - name: Resumen
         if: always()
