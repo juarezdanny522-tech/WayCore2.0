@@ -65,8 +65,15 @@ class ToolProtocolTest {
         // 200 cm está fuera del rango 20..150 que acepta el ESP32.
         assertTrue(calls("""ACCIÓN: {"name":"set_wayhat_sensitivity","args":{"centimeters":200}}""").isEmpty())
         assertTrue(calls("""ACCIÓN: {"name":"set_wayhat_sensitivity","args":{"centimeters":5}}""").isEmpty())
-        assertEquals(20, calls("""ACCIÓN: {"name":"set_wayhat_sensitivity","args":{"centimeters":20}}""").size)
-        assertEquals(150, calls("""ACCIÓN: {"name":"set_wayhat_sensitivity","args":{"centimeters":150}}""").size)
+        // Los extremos sí pasan, y con el valor intacto.
+        assertEquals(
+            20,
+            calls("""ACCIÓN: {"name":"set_wayhat_sensitivity","args":{"centimeters":20}}""").single().args.optInt("centimeters")
+        )
+        assertEquals(
+            150,
+            calls("""ACCIÓN: {"name":"set_wayhat_sensitivity","args":{"centimeters":150}}""").single().args.optInt("centimeters")
+        )
     }
 
     @Test fun `herramienta inexistente se descarta y no rompe la respuesta`() {
@@ -76,10 +83,25 @@ class ToolProtocolTest {
         assertEquals("", spoken(raw))
     }
 
-    @Test fun `json malformado dentro de una accion no se lee en voz alta`() {
-        val raw = """ACCIÓN: {"name": "set_wayhat_mode", args:{mode:CHAT}}"""
-        assertTrue(calls(raw).isEmpty())
-        assertEquals("", spoken(raw))
+    @Test fun `un json a medias no produce nada y no se habla`() {
+        for (raw in listOf("ACCIÓN: {", "ACCIÓN: {\"name\":", "ACCIÓN: {}")) {
+            assertTrue("debería ignorarse: $raw", calls(raw).isEmpty())
+            assertEquals("no debe hablarse: $raw", "", spoken(raw))
+        }
+    }
+
+    @Test fun `la tolerancia de org json recupera la intencion sin saltarse los limites`() {
+        // Descubrimiento de la prueba en la JVM: org.json (la misma clase del framework de
+        // Android) es tolerante y acepta claves y valores sin comillas. Se deja a propósito:
+        // la seguridad no depende de que el JSON sea perfecto, depende de la lista blanca y de
+        // que los centímetros estén entre 20 y 150. Un valor fuera de rango igual se descarta.
+        val result = ToolProtocol.extract("""ACCIÓN: {"name": "set_wayhat_mode", args:{mode:CHAT}}""")
+        assertEquals("set_wayhat_mode", result.second.single().name)
+        assertEquals("CHAT", result.second.single().args.optString("mode"))
+        assertEquals("", result.first)
+        assertTrue(
+            calls("""ACCIÓN: {"name": "set_wayhat_sensitivity", args:{centimeters:999}}""").isEmpty()
+        )
     }
 
     @Test fun `varias acciones en un mismo mensaje se ejecutan en orden`() {
