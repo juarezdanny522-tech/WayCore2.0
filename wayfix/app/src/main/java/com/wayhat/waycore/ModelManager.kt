@@ -148,17 +148,25 @@ object ModelManager {
      * teléfono tiene menos RAM total que la que pide el modelo, Android mata el proceso a
      * media respuesta: es mejor decirlo antes de gastar un gigabyte de datos.
      */
-    fun fitsOnThisPhone(context: Context): Boolean {
-        val abiOk = Build.SUPPORTED_ABIS.any { it.startsWith("arm64") || it == "x86_64" || it.startsWith("armeabi-v7a") }
-        return abiOk && totalRamMegabytes(context) >= specFor(context).minRamMegabytes
-    }
+    /**
+     * El motor nativo solo viene para 64 bits (en el APK hay liblitertlm_jni.so para
+     * arm64-v8a; para armeabi-v7a no existe). Comprobarlo antes de descargar evita gastar un
+     * gigabyte de datos para descubrir después que el teléfono no puede cargarlo.
+     */
+    fun hasCpuForEngine(context: Context): Boolean =
+        Build.SUPPORTED_ABIS.any { it.startsWith("arm64") || it == "x86_64" || it == "riscv64" }
+
+    fun fitsOnThisPhone(context: Context): Boolean =
+        hasCpuForEngine(context) && totalRamMegabytes(context) >= specFor(context).minRamMegabytes
 
     fun reasonItDoesNotFit(context: Context): String {
         val ram = totalRamMegabytes(context)
         val needed = specFor(context).minRamMegabytes
         return when {
-            ram in 1 until needed -> "Este teléfono tiene $ram megabytes de memoria y el modelo pide unos $needed. Prueba con la versión Q2 o con la de quinientos millones de parámetros."
-            Build.SUPPORTED_ABIS.none { it.startsWith("arm") } -> "Este teléfono no tiene procesador ARM compatible con el motor de IA local."
+            !hasCpuForEngine(context) ->
+                "Este teléfono es de 32 bits y el motor de IA local solo corre en 64 bits. Karbys puede seguir usando la nube."
+            ram in 1 until needed ->
+                "Este teléfono tiene $ram megabytes de memoria y el modelo pide unos $needed. Prueba con la versión Q2 o con la de quinientos millones de parámetros."
             else -> "No hay suficiente sitio libre para el modelo."
         }
     }

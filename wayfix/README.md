@@ -205,6 +205,10 @@ un build de CI sin teléfono. En su lugar hay un protocolo propio y determinista
 `app/src/test/java/.../ToolProtocolTest.kt` prueba todo eso (22 casos) y la acción de GitHub los
 corre antes de empaquetar; el resumen sale en `apk/test-summary.txt` de la rama de artefactos.
 
+El APK pesa ~31 MB: 9 MB de la app y ~21 MB del motor nativo de IA, nada de modelo dentro.
+Ese motor solo trae librerías para 64 bits, así que en un teléfono de 32 bits la app instala y
+funciona con Gemini, y la pantalla de cerebro local lo avisa antes de descargar nada.
+
 Requisitos del teléfono: 4 GB de RAM o más para q4_k_m (con 3 GB se puede probar q3_k_m o
 q2_k con **OTRA VERSIÓN DEL MODELO**). Con menos, la app lo dice y no intenta cargarlo: en un
 dispositivo que guía a alguien cruzando la calle, quedarse sin memoria a media generación es
