@@ -84,6 +84,12 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+        // El AAR de LiteRT-LM se publica con un Kotlin más nuevo que el del proyecto. Sin esta
+        // bandera el compilador aborta leyendo metadatos ajenos (y ni siquiera llega a revisar
+        // si nuestro código está bien); con ella se ignora la diferencia de versión y el resto
+        // de la API se usa normal. Si alguna vez falla, la alternativa es subir
+        // org.jetbrains.kotlin.android / plugin.compose a la versión con la que viene built.
+        freeCompilerArgs += "-Xskip-metadata-version-check"
     }
 
     buildFeatures {
@@ -121,7 +127,9 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     // Motor de inferencia local (llama.cpp por dentro) para el GGUF de Qwen.
-    implementation("com.google.ai.edge.litertlm:litertlm-android:latest.release")
+        // Versión fijada en vez de latest.release: 0.17.1 es la que se probó contra esta app.
+    // Si se sube, hay que volver a pasar las pruebas del motor (el AAR cambia su API).
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.17.1")
 
     testImplementation("junit:junit:4.13.2")
     // En las pruebas de JVM org.json no viene del framework de Android.
