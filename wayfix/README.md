@@ -1,4 +1,4 @@
-# WayCore 0.6.0 + WayHat v6.1 — sombrero con ESP32, voz con Gemini
+# WayCore 0.7.0 + WayHat v6.1 — sombrero con ESP32, cerebro local y voz
 
 WayCore es la app de Android que escucha, habla y controla al WayHat: un sombrero con
 ESP32‑WROOM‑32 que mide distancias con ultrasónico y LiDAR, temperatura y humedad, y avisa

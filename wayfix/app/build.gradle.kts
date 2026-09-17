@@ -43,8 +43,8 @@ android {
         applicationId = "com.wayhat.waycore"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.6.0"
+        versionCode = 8
+        versionName = "0.7.0"
         buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
 
         // El motor de IA local trae librerías nativas por arquitectura. Sin este filtro el
