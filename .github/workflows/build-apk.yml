@@ -1,0 +1,164 @@
+name: Compilar WayCore (APK)
+
+# Compila el APK de WayCore y lo deja disponible en tres lugares:
+#   1. Artifact de la ejecución de Actions.
+#   2. Asset del release rolling `waycore-latest` (el enlace que se instala en el teléfono).
+#   3. Rama efímera `arena/apk-artifacts`, solo para que el agente del taller pueda
+#      traer el archivo al sandbox (la API de contenidos de GitHub sí es accesible ahí).
+#
+# No usa el wrapper de Gradle: instala Gradle 8.11.1 con gradle/actions/setup-gradle.
+
+on:
+  push:
+    paths:
+      - 'wayfix/**'
+      - '.github/workflows/build-apk.yml'
+  pull_request:
+    paths:
+      - 'wayfix/**'
+  workflow_dispatch:
+    inputs:
+      build_release:
+        description: 'Compilar también el build release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: APK de prueba (debug key)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+
+    env:
+      GRADLE_FLAGS: --no-daemon --stacktrace --console=plain
+      APK_DEBUG: wayfix/app/build/outputs/apk/debug/app-debug.apk
+      APK_RELEASE: wayfix/app/build/outputs/apk/release/app-release.apk
+
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Instalar Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Instalar Gradle 8.11.1 y cachear dependencias
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+          cache-read-only: ${{ github.ref_name != github.event.repository.default_branch }}
+
+      - name: Instalar Android SDK 35
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0'
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+
+      - name: Verificar herramientas
+        run: |
+          java -version
+          gradle --version | head -5
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/build-tools" || true
+
+      # La clave NUNCA se imprime en el log: se escribe directo al archivo de build.
+      # Sin clave embebida el APK sirve igual y se configura desde la app
+      # (sección "Ajustes de Karbys"), que es la forma recomendada de repartirlo.
+      - name: Escribir local.properties si existe el secret GEMINI_API_KEY
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -n "${GEMINI_API_KEY}" ]; then
+            printf 'GEMINI_API_KEY=%s\n' "$GEMINI_API_KEY" >> wayfix/local.properties
+            echo "Clave embebida en el APK (longitud: ${#GEMINI_API_KEY})."
+          else
+            echo "Sin clave embebida: se pedirá dentro de la app."
+          fi
+
+      - name: Compilar APK de prueba
+        working-directory: wayfix
+        run: gradle $GRADLE_FLAGS assembleDebug
+
+      - name: Compilar APK release
+        if: ${{ github.event.inputs.build_release != 'false' }}
+        working-directory: wayfix
+        run: gradle $GRADLE_FLAGS assembleRelease
+
+      - name: Mostrar tamaño y firma de los APK
+        run: |
+          for f in "$APK_DEBUG" "$APK_RELEASE"; do
+            if [ -f "$f" ]; then
+              echo "== $f ($(du -h "$f" | cut -f1)) =="
+              "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs "$f" 2>/dev/null | head -4 || true
+            fi
+          done
+
+      - name: Guardar APK como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WayCore-APK
+          path: |
+            ${{ env.APK_DEBUG }}
+            ${{ env.APK_RELEASE }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publicar el APK en el release 'waycore-latest'
+        if: github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA:0:7}"
+          cp "$APK_DEBUG" "WayCore-${short}-debug.apk"
+          cp "$APK_DEBUG" "WayCore-latest-debug.apk"
+          assets=( "WayCore-${short}-debug.apk" "WayCore-latest-debug.apk" )
+          if [ -f "$APK_RELEASE" ]; then
+            cp "$APK_RELEASE" "WayCore-${short}-release.apk"
+            assets+=( "WayCore-${short}-release.apk" )
+          fi
+          if ! gh release view waycore-latest >/dev/null 2>&1; then
+            gh release create waycore-latest --target "$GITHUB_SHA" \
+              --title "WayCore APK (build automático)" \
+              --notes "APK de prueba generado por la acción Compilar WayCore. Sirve para instalar en el teléfono con 'instalar apps desconocidas' habilitado. El enlace fijo es WayCore-latest-debug.apk." \
+              --prerelease
+          fi
+          gh release upload waycore-latest "${assets[@]}" --clobber
+          echo "Descarga: https://github.com/${GITHUB_REPOSITORY}/releases/download/waycore-latest/WayCore-latest-debug.apk"
+
+      - name: Dejar el APK en arena/apk-artifacts
+        if: github.event_name == 'push' && startsWith(github.ref_name, 'arena/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git switch --orphan apk-temporal
+          mkdir -p apk
+          cp "$APK_DEBUG" apk/WayCore-debug.apk
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -f apk/WayCore-debug.apk
+          git commit -q -m "apk: build $GITHUB_SHA"
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            HEAD:refs/heads/arena/apk-artifacts
+          echo "APK disponible en la rama arena/apk-artifacts (apk/WayCore-debug.apk)."
+
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "### APK de WayCore"
+            echo "- Rama: \`${GITHUB_REF_NAME}\` · commit \`${GITHUB_SHA:0:7}\`"
+            echo "- Release rolling: https://github.com/${GITHUB_REPOSITORY}/releases/tag/waycore-latest"
+            echo "- El debug APK se instala directo; el release APK está firmado con la debug key porque el repo no tiene keystore propia."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -5,6 +5,7 @@ import android.content.*
 import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.os.*
+import android.speech.SpeechRecognizer
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -32,11 +33,18 @@ class MainActivity : ComponentActivity() {
     private var rear by mutableStateOf(-1)
     private var tf by mutableStateOf(-1)
     private var closest by mutableStateOf(-1)
+    private var temp by mutableStateOf("sin lectura")
+    private var hum by mutableStateOf("sin lectura")
     private var threshold by mutableStateOf(50)
     private var mode by mutableStateOf("SAFE")
     private var buzzer by mutableStateOf(true)
     private var battery by mutableStateOf(0)
     private var locationText by mutableStateOf("Ubicación no disponible")
+    private var lastKarbys by mutableStateOf("Karbys todavía no ha dicho nada.")
+    private var voiceAvailable by mutableStateOf(true)
+    private var keyConfigured by mutableStateOf(false)
+    private var keyDraft by mutableStateOf("")
+    private var modelDraft by mutableStateOf("")
 
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
         val mic = result[Manifest.permission.RECORD_AUDIO] == true || has(Manifest.permission.RECORD_AUDIO)
@@ -47,33 +55,48 @@ class MainActivity : ComponentActivity() {
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action != WayHatService.ACTION_STATUS) return
-            intent.getStringExtra("message")?.let { wayHatMessage = it }
-            if (intent.hasExtra("connected")) wayHatConnected = intent.getBooleanExtra("connected", false)
-            intent.getStringExtra("telemetry")?.let { parseTelemetry(it) }
+            when (intent?.action) {
+                WayHatService.ACTION_STATUS -> {
+                    intent.getStringExtra("message")?.let { wayHatMessage = it }
+                    if (intent.hasExtra("connected")) wayHatConnected = intent.getBooleanExtra("connected", false)
+                    intent.getStringExtra("telemetry")?.let { parseTelemetry(it) }
+                }
+                KarbysService.ACTION_UI -> intent.getStringExtra("message")?.let { lastKarbys = it }
+            }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val filter = IntentFilter(WayHatService.ACTION_STATUS)
+        val filter = IntentFilter(WayHatService.ACTION_STATUS).apply { addAction(KarbysService.ACTION_UI) }
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         else registerReceiver(receiver, filter)
+
+        voiceAvailable = SpeechRecognizer.isRecognitionAvailable(this)
+        keyConfigured = Prefs.hasApiKey(this)
+        keyDraft = ""
+        modelDraft = Prefs.model(this)
+
         setContent {
+            var prompt by remember { mutableStateOf("") }
             MaterialTheme {
                 Surface(Modifier.fillMaxSize()) {
-                    var prompt by remember { mutableStateOf("") }
                     Column(
                         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text("WAYCORE", style = MaterialTheme.typography.headlineMedium)
+                        Text("Versión ${BuildConfig.VERSION_NAME}")
                         Text(if (wayHatConnected) "WayHat conectado" else wayHatMessage)
+                        if (!voiceAvailable) {
+                            Text("Este teléfono no tiene servicio de reconocimiento de voz: Karbys solo responderá por texto.")
+                        }
                         Spacer(Modifier.height(14.dp))
                         Button(
                             onClick = { if (!ready) requestPermissionsIfNeeded() else send(KarbysService.ACTION_LISTEN) },
                             modifier = Modifier.size(230.dp).semantics { contentDescription = "Hablar con Karbys" }
                         ) { Text(if (ready) "HABLAR" else "KARBYS") }
+                        Text(lastKarbys)
 
                         OutlinedTextField(
                             value = prompt, onValueChange = { prompt = it },
@@ -92,15 +115,16 @@ class MainActivity : ComponentActivity() {
                             Button(onClick = { mode = "CHAT"; sendConfig() }, Modifier.weight(1f)) { Text("CHARLA") }
                         }
                         Text("Sensibilidad: $threshold cm")
-                        Slider(value = threshold.toFloat(), onValueChange = { threshold = (it / 5).roundToInt() * 5 }, valueRange = 20f..100f, onValueChangeFinished = { sendConfig() })
+                        Slider(value = threshold.toFloat(), onValueChange = { threshold = (it / 5).roundToInt() * 5 }, valueRange = 20f..150f, onValueChangeFinished = { sendConfig() })
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Text("Avisos sonoros")
                             Spacer(Modifier.width(12.dp))
                             Switch(checked = buzzer, onCheckedChange = { buzzer = it; sendConfig() })
                         }
 
-                        Text("Derecha: ${cm(right)}   Izquierda: ${cm(left)}   Atrás: ${cm(rear)}")
-                        Text("TF-Luna: ${cm(tf)}   Más cercano: ${cm(closest)}")
+                        Text("Frente: ${cm(tf)}   Derecha: ${cm(right)}   Izquierda: ${cm(left)}   Atrás: ${cm(rear)}")
+                        Text("Más cercano: ${cm(closest)}")
+                        Text("Temperatura: $temp   Humedad: $hum")
                         Text("Batería: $battery%")
                         Text("GPS: $locationText")
                         Spacer(Modifier.height(12.dp))
@@ -110,6 +134,26 @@ class MainActivity : ComponentActivity() {
                             Button(onClick = { sendHardware("SENSORS") }) { Text("ACTUALIZAR") }
                         }
                         if (paused) Button(onClick = { requestPermissionsIfNeeded() }) { Text("ACTIVAR KARBYS") }
+
+                        HorizontalDivider(Modifier.padding(vertical = 18.dp))
+                        Text("AJUSTES DE KARBYS", style = MaterialTheme.typography.titleLarge)
+                        Text(if (keyConfigured) "Clave de Gemini guardada en este teléfono" else "Falta la clave de Gemini: Karbys solo usará comandos locales")
+                        OutlinedTextField(
+                            value = keyDraft, onValueChange = { keyDraft = it },
+                            modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                            label = { Text("Clave de Gemini (AI Studio)") },
+                            singleLine = true
+                        )
+                        OutlinedTextField(
+                            value = modelDraft, onValueChange = { modelDraft = it },
+                            modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                            label = { Text("Modelo (opcional): ${GeminiClient.models(this).joinToString(" o ")}") },
+                            singleLine = true
+                        )
+                        Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { saveSettings() }, modifier = Modifier.weight(1f)) { Text("GUARDAR") }
+                            Button(onClick = { send(KarbysService.ACTION_GREETING) }, modifier = Modifier.weight(1f)) { Text("SALUDAR") }
+                        }
                     }
                 }
             }
@@ -117,9 +161,21 @@ class MainActivity : ComponentActivity() {
         requestPermissionsIfNeeded()
     }
 
+    override fun onResume() {
+        super.onResume()
+        updateDeviceInfo()
+        keyConfigured = Prefs.hasApiKey(this)
+    }
+
     override fun onDestroy() {
-        unregisterReceiver(receiver)
+        try { unregisterReceiver(receiver) } catch (_: Exception) { }
         super.onDestroy()
+    }
+
+    private fun saveSettings() {
+        Prefs.setApiKey(this, keyDraft.trim())
+        Prefs.setModel(this, modelDraft.trim())
+        keyConfigured = Prefs.hasApiKey(this)
     }
 
     private fun requestPermissionsIfNeeded() {
@@ -159,9 +215,11 @@ class MainActivity : ComponentActivity() {
             val o = JSONObject(line)
             right = o.optInt("right", right); left = o.optInt("left", left); rear = o.optInt("rear", rear)
             tf = o.optInt("tf", tf); closest = o.optInt("closest", closest)
-            threshold = o.optInt("threshold", threshold)
+            threshold = o.optInt("threshold", threshold).coerceIn(20, 150)
             mode = o.optString("mode", mode)
             buzzer = o.optBoolean("buzzer", buzzer)
+            (o.opt("temp") as? Number)?.let { temp = "$it °C" }
+            (o.opt("hum") as? Number)?.let { hum = "$it %" }
         } catch (_: Exception) { }
     }
 

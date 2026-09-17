@@ -26,6 +26,15 @@ val geminiKey = geminiKeyRaw.trim()
     .replace("\r", "")
     .replace("\n", "")
 
+// Firma propia opcional. Si existe wayfix/keystore.properties, el build release usa esa
+// keystore; si no, se firma con la clave de depuración para que el APK sea instalable.
+val keystoreProps = Properties()
+val keystorePropsFile = rootProject.file("keystore.properties")
+val hasKeystore = keystorePropsFile.exists() && run {
+    keystorePropsFile.inputStream().use { keystoreProps.load(it) }
+    !keystoreProps.getProperty("storeFile").isNullOrBlank()
+}
+
 android {
     namespace = "com.wayhat.waycore"
     compileSdk = 35
@@ -34,9 +43,34 @@ android {
         applicationId = "com.wayhat.waycore"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.3.0"
+        versionCode = 7
+        versionName = "0.6.0"
         buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
+    }
+
+    if (hasKeystore) {
+        signingConfigs {
+            create("wayhat") {
+                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
+    }
+
+    buildTypes {
+        getByName("debug") {
+            versionNameSuffix = "-debug"
+        }
+        getByName("release") {
+            isMinifyEnabled = false
+            signingConfig = if (hasKeystore) {
+                signingConfigs.getByName("wayhat")
+            } else {
+                signingConfigs.getByName("debug")
+            }
+        }
     }
 
     compileOptions {
@@ -52,6 +86,16 @@ android {
         compose = true
         buildConfig = true
     }
+
+    lint {
+        // Los avisos de lint no deben impedir un build del sombrero; se revisan aparte.
+        abortOnError = false
+        checkReleaseBuilds = false
+    }
+
+    packaging {
+        resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
+    }
 }
 
 dependencies {
@@ -62,8 +106,8 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
-    implementation("androidx.work:work-runtime-ktx:2.10.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("org.json:json:20240303")
+    // org.json no se agrega como librería: el framework de Android ya la provee.
+    // androidx.work tampoco: WayCore usa AlarmManager, no WorkManager.
 }

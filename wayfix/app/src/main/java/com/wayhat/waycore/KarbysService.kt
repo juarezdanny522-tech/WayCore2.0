@@ -29,6 +29,8 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
         const val ACTION_GREETING = "GREETING"
         const val ACTION_REMINDER = "REMINDER"
         const val ACTION_TEXT = "TEXT"
+        /** Aviso opcional para la interfaz: la app puede mostrar lo que Karbys está diciendo. */
+        const val ACTION_UI = "com.wayhat.waycore.UI"
         const val CHANNEL = "karbys_assistant"
         const val NOTIFICATION_ID = 2401
         private const val CONTINUATION_SILENCE_MS = 4500L
@@ -405,9 +407,10 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
         processing = true
         continuationDeadline = 0L
         val clean = text.trim()
+        publishUiEvent("Escuché: $clean", false)
         scope.launch {
             val direct = executeLocalCommand(clean)
-            val answer = direct ?: GeminiClient.ask(clean, memory.toList(), buildDeviceContext())
+            val answer = direct ?: GeminiClient.ask(this@KarbysService, clean, memory.toList(), buildDeviceContext())
             memory.add(ConversationTurn(clean, answer))
             while (memory.size > 4) memory.removeAt(0)
             withContext(Dispatchers.Main) {
@@ -441,10 +444,7 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
                 val cm = Regex("\\d+").find(n)?.value?.toIntOrNull() ?: -1
                 WayHatService.executeTool("set_wayhat_sensitivity", JSONObject().put("centimeters", cm))
             }
-            n.contains("estado de wayhat") || n.contains("estado del wayhat") || n.contains("sensores de wayhat") -> {
-                val t = WayHatService.telemetrySnapshot()
-                if (t.contains("\"available\":true")) "WayHat está conectado. Lecturas actuales: $t" else "WayHat no está conectado en este momento."
-            }
+            n.contains("estado de wayhat") || n.contains("estado del wayhat") || n.contains("sensores de wayhat") -> telemetrySpeech()
             n.contains("actualiza los sensores") || n.contains("actualiza wayhat") -> WayHatService.executeTool("refresh_wayhat_telemetry", JSONObject())
             n.contains("prueba el buzzer") || n.contains("prueba el sonido de wayhat") -> WayHatService.executeTool("test_wayhat_alert", JSONObject())
             n.contains("cancela todas las alarmas") || n.contains("borra todos los recordatorios") -> {
@@ -453,6 +453,41 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
             }
             else -> null
         }
+    }
+
+    /**
+     * Resumen hablado de la telemetría. Se evita leer JSON crudo: para una persona
+     * ciega escuchar llaves, comas y comillas no es información, es ruido.
+     */
+    private fun telemetrySpeech(): String {
+        val o = try {
+            JSONObject(WayHatService.telemetrySnapshot())
+        } catch (_: Exception) {
+            return "No pude leer la telemetría de WayHat."
+        }
+        if (!o.optBoolean("available", false)) return "WayHat no está conectado en este momento."
+
+        val right = o.optInt("right", -1)
+        val left = o.optInt("left", -1)
+        val rear = o.optInt("rear", -1)
+        val tf = o.optInt("tf", -1)
+        val closest = o.optInt("closest", -1)
+        val threshold = o.optInt("threshold", 50)
+        val mode = if (o.optString("mode", "SAFE") == "SAFE") "modo seguro" else "modo charla"
+        val alerts = if (o.optBoolean("buzzer", true)) "con avisos sonoros" else "con avisos sonoros apagados"
+
+        fun distance(label: String, value: Int) = if (value > 0) "$label $value centímetros" else "$label sin lectura"
+
+        val temp = o.opt("temp")
+        val hum = o.opt("hum")
+        val climate = if (temp is Number && hum is Number) " Temperatura $temp grados, humedad $hum por ciento." else ""
+
+        val nearest = if (closest > 0) " El obstáculo más cercano está a $closest centímetros." else " No hay obstáculos dentro del rango."
+        return "WayHat conectado, $mode, $alerts, sensibilidad $threshold centímetros. " +
+            distance("Frente", tf) + ". " +
+            distance("Derecha", right) + ". " +
+            distance("Izquierda", left) + ". " +
+            distance("Atrás", rear) + "." + nearest + climate
     }
 
     private fun buildDeviceContext(): String {
@@ -476,20 +511,35 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
             }
         }
 
+        val snapshot = WayHatService.telemetrySnapshot()
+        val weather = try {
+            val reading = JSONObject(snapshot)
+            val temp = reading.opt("temp")
+            val hum = reading.opt("hum")
+            if (temp is Number && hum is Number) {
+                "DHT11: temperatura ${temp} grados Celsius, humedad ${hum} por ciento"
+            } else {
+                "DHT11: sin lectura de temperatura o humedad disponible"
+            }
+        } catch (_: Exception) { "DHT11: sin lectura disponible" }
+
         val bt = try {
-            JSONObject(WayHatService.telemetrySnapshot()).apply {
+            JSONObject(snapshot).apply {
+                remove("type")
+                remove("uptime_ms")
                 remove("temp")
                 remove("hum")
-                remove("dht_ok")
             }.toString()
-        } catch (_: Exception) { WayHatService.telemetrySnapshot() }
+        } catch (_: Exception) { snapshot }
         val time = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale("es", "MX")).format(Date())
         return """
 Hora local del teléfono: $time
 Batería del teléfono: ${if (battery in 0..100) "$battery%" else "unavailable"}
 Ubicación del teléfono: $location
+$weather
 WayHat telemetría JSON (fuente de verdad): $bt
 Regla de seguridad: el TF-Luna tiene una zona de protección de mayor alcance que los HC-SR04.
+Un valor -1 o null en distancias significa que ese sensor no obtuvo lectura, no que esté vacío ni que haya pared.
 """.trimIndent()
     }
 
@@ -573,6 +623,17 @@ Regla de seguridad: el TF-Luna tiene una zona de protección de mayor alcance qu
     private fun beepAlert() { try { tone?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 250) } catch (_: Exception) {} }
     private fun cancelContinuationTimeout() { continuationTimeout?.let(main::removeCallbacks); continuationTimeout = null }
 
+    /** Solo informativo: permite que la pantalla muestre qué está pasando con Karbys. */
+    private fun publishUiEvent(message: String, speaking: Boolean) {
+        try {
+            sendBroadcast(
+                Intent(ACTION_UI).setPackage(packageName)
+                    .putExtra("message", message)
+                    .putExtra("speaking", speaking)
+            )
+        } catch (_: Exception) { }
+    }
+
     private fun speak(text: String) {
         pausedByUser = false
         if (!::tts.isInitialized) { startHotword(); return }
@@ -581,6 +642,7 @@ Regla de seguridad: el TF-Luna tiene una zona de protección de mayor alcance qu
         val spoken = text.replace("WayCore", "guaycor", ignoreCase = true)
             .replace("WayHat", "guayjat", ignoreCase = true)
             .replace("WayCorp", "guaycorp", ignoreCase = true)
+        publishUiEvent(spoken, true)
         beepReady()
         main.postDelayed({
             routeToHeadsetIfPossible()

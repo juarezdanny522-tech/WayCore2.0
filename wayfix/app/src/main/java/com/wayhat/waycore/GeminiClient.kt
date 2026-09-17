@@ -1,5 +1,6 @@
 package com.wayhat.waycore
 
+import android.content.Context
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -8,68 +9,130 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
+/**
+ * Cliente de Gemini con function calling para controlar WayHat.
+ *
+ * Dos detalles importantes:
+ *  - La clave se lee de Prefs (ajustes en la app) y solo usa BuildConfig como respaldo,
+ *    para poder repartir el mismo APK sin dejar una clave dentro del repositorio.
+ *  - Si Google jubila un id de modelo, WayCore prueba los siguientes en la lista en vez
+ *    de quedarse mudo.
+ */
 object GeminiClient {
-    private const val MODEL = "gemini-3.1-flash-lite"
+    private const val RETRY_MODEL = "\u0000model"
+
+    private val FALLBACK_MODELS = listOf(
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3-flash-preview",
+        "gemini-2.5-flash"
+    )
+
+    val MODEL_SUGGESTIONS: List<String> get() = FALLBACK_MODELS
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(45, TimeUnit.SECONDS)
         .writeTimeout(20, TimeUnit.SECONDS)
         .build()
 
-    suspend fun ask(user: String, memory: List<ConversationTurn>, deviceContext: String): String {
-        val apiKey = BuildConfig.GEMINI_API_KEY.trim()
-        if (apiKey.isBlank()) return "Falta configurar la clave de Gemini en WayCore."
+    fun models(context: Context): List<String> =
+        (listOf(Prefs.model(context)) + FALLBACK_MODELS).map { it.trim() }.filter { it.isNotBlank() }.distinct()
+
+    suspend fun ask(context: Context, user: String, memory: List<ConversationTurn>, deviceContext: String): String {
+        val apiKey = Prefs.apiKey(context)
+        if (apiKey.isBlank()) return "Todavía falta tu clave de Gemini. Abre WayCore, escríbela en el campo Clave de Gemini y toca Guardar clave. Mientras tanto sí puedo hablar de WayHat, sensores, alarmas y recordatorios."
         if (user.isBlank()) return "No escuché ninguna pregunta."
 
-        return try {
-            val contents = JSONArray().put(
-                JSONObject().put("role", "user").put(
-                    "parts", JSONArray().put(JSONObject().put("text", buildPrompt(user, memory, deviceContext)))
-                )
-            )
-
-            repeat(3) {
-                val raw = generate(apiKey, contents)
-                if (raw == null) return "No pude obtener una respuesta válida de Gemini."
-                val candidate = raw.optJSONArray("candidates")?.optJSONObject(0)
-                    ?: return "Gemini no devolvió una respuesta válida."
-                val modelContent = candidate.optJSONObject("content") ?: JSONObject()
-                val parts = modelContent.optJSONArray("parts") ?: JSONArray()
-
-                val calls = mutableListOf<JSONObject>()
-                var text = ""
-                for (i in 0 until parts.length()) {
-                    val part = parts.optJSONObject(i) ?: continue
-                    part.optJSONObject("functionCall")?.let { calls += it }
-                    val t = part.optString("text").trim()
-                    if (t.isNotBlank()) text = if (text.isBlank()) t else "$text\n$t"
-                }
-
-                if (calls.isEmpty()) return text.ifBlank { "No recibí una respuesta hablada de Gemini." }
-
-                // Preserve Gemini's model content, including tool-call metadata/signatures.
-                contents.put(JSONObject(modelContent.toString()).put("role", "model"))
-                val responseParts = JSONArray()
-                for (call in calls) {
-                    val name = call.optString("name")
-                    val args = call.optJSONObject("args") ?: JSONObject()
-                    val result = WayHatService.executeTool(name, args)
-                    responseParts.put(
-                        JSONObject().put("functionResponse", JSONObject()
-                            .put("name", name)
-                            .put("response", JSONObject().put("result", result)))
-                    )
-                }
-                contents.put(JSONObject().put("role", "user").put("parts", responseParts))
+        val candidates = models(context)
+        var modelUnavailable = false
+        for (model in candidates) {
+            val answer = converse(model, apiKey, user, memory, deviceContext)
+            if (answer == RETRY_MODEL) {
+                modelUnavailable = true
+            } else {
+                return answer
             }
-
-            "No pude terminar la acción de WayHat en este momento."
-        } catch (_: Exception) {
-            "No pude conectar con Gemini. Revisa tu conexión a Internet."
+        }
+        return if (modelUnavailable) {
+            "Ninguno de los modelos que conoce WayCore funciona con tu clave. Los que prueba son ${candidates.joinToString(", ")}. Puedes escribir otro nombre de modelo en los ajustes."
+        } else {
+            "No pude obtener una respuesta válida de Gemini."
         }
     }
 
-    private fun generate(apiKey: String, contents: JSONArray): JSONObject? {
+    private suspend fun converse(
+        model: String,
+        apiKey: String,
+        user: String,
+        memory: List<ConversationTurn>,
+        deviceContext: String
+    ): String {
+        val contents = JSONArray().put(
+            JSONObject().put("role", "user").put(
+                "parts", JSONArray().put(JSONObject().put("text", buildPrompt(user, memory, deviceContext)))
+            )
+        )
+
+        repeat(3) {
+            val reply = generate(model, apiKey, contents)
+            val error = reply.json?.optJSONObject("error")
+            val status = error?.optString("status").orEmpty().uppercase()
+
+            when {
+                reply.code == 200 -> Unit
+                reply.code == 0 -> return "No pude conectar con Gemini. Revisa tu conexión a Internet."
+                reply.code == 401 || reply.code == 403 || status.contains("API_KEY") ->
+                    return "La clave de Gemini no es válida o no tiene permiso para este modelo. Revísala en los ajustes de WayCore."
+                reply.code == 429 || status.contains("RESOURCE_EXHAUSTED") ->
+                    return "Gemini dice que vas pasado de peticiones por ahora. Espera un minuto y pregúntame de nuevo."
+                reply.code == 404 || status.contains("NOT_FOUND") || status.contains("NOT_SUPPORTED") ->
+                    return RETRY_MODEL
+                else -> return "Gemini respondió un error ${reply.code}. Si sigue pasando, cambia el modelo en los ajustes de WayCore."
+            }
+
+            val raw = reply.json ?: return "Gemini devolvió una respuesta vacía."
+            val blocked = raw.optJSONObject("promptFeedback")?.optString("blockReason").orEmpty()
+            if (blocked.isNotBlank()) return "Gemini frenó esta pregunta por su regla de seguridad $blocked. Intenta formularla de otra forma."
+
+            val candidate = raw.optJSONArray("candidates")?.optJSONObject(0)
+                ?: return "Gemini no devolvió una respuesta válida."
+            val modelContent = candidate.optJSONObject("content") ?: JSONObject()
+            val parts = modelContent.optJSONArray("parts") ?: JSONArray()
+
+            val calls = mutableListOf<JSONObject>()
+            var text = ""
+            for (i in 0 until parts.length()) {
+                val part = parts.optJSONObject(i) ?: continue
+                part.optJSONObject("functionCall")?.let { calls += it }
+                val t = part.optString("text").trim()
+                if (t.isNotBlank()) text = if (text.isBlank()) t else "$text\n$t"
+            }
+
+            if (calls.isEmpty()) return text.ifBlank { "No recibí una respuesta hablada de Gemini." }
+
+            // Preserve Gemini's model content, including tool-call metadata/signatures.
+            contents.put(JSONObject(modelContent.toString()).put("role", "model"))
+            val responseParts = JSONArray()
+            for (call in calls) {
+                val name = call.optString("name")
+                val args = call.optJSONObject("args") ?: JSONObject()
+                val result = WayHatService.executeTool(name, args)
+                responseParts.put(
+                    JSONObject().put("functionResponse", JSONObject()
+                        .put("name", name)
+                        .put("response", JSONObject().put("result", result)))
+                )
+            }
+            contents.put(JSONObject().put("role", "user").put("parts", responseParts))
+        }
+
+        return "No pude terminar la acción de WayHat en este momento."
+    }
+
+    private class Reply(val code: Int, val json: JSONObject?)
+
+    private fun generate(model: String, apiKey: String, contents: JSONArray): Reply {
         val body = JSONObject()
             .put("contents", contents)
             .put("tools", JSONArray().put(JSONObject().put("functionDeclarations", toolDeclarations())))
@@ -77,16 +140,20 @@ object GeminiClient {
             .toRequestBody("application/json; charset=utf-8".toMediaType())
 
         val request = Request.Builder()
-            .url("https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent")
+            .url("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
             .addHeader("x-goog-api-key", apiKey)
             .addHeader("Content-Type", "application/json")
             .post(body)
             .build()
 
-        client.newCall(request).execute().use { response ->
-            val raw = response.body?.string().orEmpty()
-            if (!response.isSuccessful) return null
-            return JSONObject(raw)
+        return try {
+            client.newCall(request).execute().use { response ->
+                val raw = response.body?.string().orEmpty()
+                val parsed = try { JSONObject(raw) } catch (_: Exception) { null }
+                Reply(if (response.isSuccessful) 200 else response.code, parsed)
+            }
+        } catch (_: Exception) {
+            Reply(0, null)
         }
     }
 

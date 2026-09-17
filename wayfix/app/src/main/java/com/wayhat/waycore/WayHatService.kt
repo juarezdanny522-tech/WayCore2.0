@@ -221,18 +221,18 @@ class WayHatService : Service() {
         ).filterNotNull().minOrNull() ?: return
 
         val now = System.currentTimeMillis()
-        if (now - lastVibrationAt < 350L) return
+        val maxDistance = maxOf(threshold, tfSafetyDistance).coerceAtLeast(1)
+
+        // gap = pausa entre pulsos: mientras más cerca el obstáculo, más rápido vibra.
+        // Antes este valor se calculaba y nunca se usaba, así que el teléfono vibraba
+        // igual a 20 cm que a 1 metro.
+        val gap = ((dangerDistance.toLong() * 320L) / maxDistance.toLong()).coerceIn(35L, 260L)
+        if (now - lastVibrationAt < gap + 90L) return
         lastVibrationAt = now
 
-        val maxDistance = maxOf(threshold, tfSafetyDistance)
-        val gap = ((dangerDistance.toLong() * 320L) / maxDistance.toLong()).coerceIn(35L, 260L)
+        val pattern = if (dangerDistance * 2 <= maxDistance) longArrayOf(0, 130, 55, 130) else longArrayOf(0, 95)
         try {
-            if (Build.VERSION.SDK_INT >= 26) {
-                vibrator.vibrate(VibrationEffect.createOneShot(90L, 180))
-            } else {
-                @Suppress("DEPRECATION")
-                vibrator.vibrate(90L)
-            }
+            vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
         } catch (_: Exception) { }
     }
 
@@ -279,7 +279,10 @@ class WayHatService : Service() {
         pendingAcks[commandId] = waiter
         sendJson(json.toString())
         return try {
-            withTimeout(1800L) { waiter.await() }
+            withTimeout(3000L) { waiter.await() }
+        } catch (_: TimeoutCancellationException) {
+            pendingAcks.remove(commandId)
+            "Le mandé la orden a WayHat pero el sombrero no confirmó a tiempo. Revisa que esté encendido y conectado por Bluetooth."
         } catch (_: CancellationException) {
             pendingAcks.remove(commandId)
             "No pude confirmar el comando porque se perdió la conexión con WayHat."

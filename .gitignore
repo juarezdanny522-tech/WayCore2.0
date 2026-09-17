@@ -1,0 +1,22 @@
+# Construcción
+.gradle/
+build/
+*/build/
+captures/
+.cxx/
+local.properties
+
+# Claves: nunca subir un keystore ni una API key
+*.keystore
+*.jks
+keystore.properties
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+.kotlin/
+
+# APk sueltos
+*.apk
+!apk/*.apk
