@@ -37,11 +37,15 @@ class MainActivity : ComponentActivity() {
     private var buzzer by mutableStateOf(true)
     private var battery by mutableStateOf(0)
     private var locationText by mutableStateOf("Ubicación no disponible")
+    private var modelState by mutableStateOf(ModelService.state)
+    private var modelMessage by mutableStateOf(ModelService.message)
+    private var modelProgress by mutableStateOf(ModelService.progressPct)
 
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
         val mic = result[Manifest.permission.RECORD_AUDIO] == true || has(Manifest.permission.RECORD_AUDIO)
         if (mic) startKarbys() else paused = true
         startWayHat()
+        startModelService()
         updateDeviceInfo()
     }
 
@@ -54,11 +58,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val modelReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != ModelService.ACTION_STATUS) return
+            modelState = ModelService.state
+            modelMessage = ModelService.message
+            modelProgress = ModelService.progressPct
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val filter = IntentFilter(WayHatService.ACTION_STATUS)
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         else registerReceiver(receiver, filter)
+        val modelFilter = IntentFilter(ModelService.ACTION_STATUS)
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(modelReceiver, modelFilter, Context.RECEIVER_NOT_EXPORTED)
+        else registerReceiver(modelReceiver, modelFilter)
         setContent {
             MaterialTheme {
                 Surface(Modifier.fillMaxSize()) {
@@ -82,6 +98,27 @@ class MainActivity : ComponentActivity() {
                         )
                         Button(onClick = { if (prompt.isNotBlank()) { sendText(prompt.trim()); prompt = "" } }, modifier = Modifier.padding(top = 8.dp)) {
                             Text("ENVIAR")
+                        }
+
+                        HorizontalDivider(Modifier.padding(vertical = 18.dp))
+                        Text("MODELO LOCAL DE KARBYS", style = MaterialTheme.typography.titleLarge)
+                        Text(modelMessage)
+                        if (modelState == ModelService.STATE_DOWNLOADING) {
+                            LinearProgressIndicator(
+                                progress = { modelProgress / 100f },
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp)
+                                    .semantics { contentDescription = "Descargando modelo: $modelProgress por ciento" }
+                            )
+                            Button(onClick = { sendModelAction(ModelService.ACTION_CANCEL_DOWNLOAD) }, modifier = Modifier.padding(top = 6.dp)) {
+                                Text("CANCELAR DESCARGA")
+                            }
+                        } else {
+                            Button(
+                                onClick = { sendModelAction(modelActionFor(modelState)) },
+                                modifier = Modifier.padding(top = 10.dp).semantics { contentDescription = modelButtonLabel(modelState) }
+                            ) {
+                                Text(modelButtonLabel(modelState))
+                            }
                         }
 
                         HorizontalDivider(Modifier.padding(vertical = 18.dp))
@@ -119,6 +156,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         unregisterReceiver(receiver)
+        unregisterReceiver(modelReceiver)
         super.onDestroy()
     }
 
@@ -129,12 +167,47 @@ class MainActivity : ComponentActivity() {
         if (Build.VERSION.SDK_INT >= 31 && !has(Manifest.permission.BLUETOOTH_CONNECT)) needed += Manifest.permission.BLUETOOTH_CONNECT
         if (Build.VERSION.SDK_INT >= 31 && !has(Manifest.permission.BLUETOOTH_SCAN)) needed += Manifest.permission.BLUETOOTH_SCAN
         if (Build.VERSION.SDK_INT >= 33 && !has(Manifest.permission.POST_NOTIFICATIONS)) needed += Manifest.permission.POST_NOTIFICATIONS
-        if (needed.isEmpty()) { startKarbys(); startWayHat(); updateDeviceInfo() } else permissions.launch(needed.toTypedArray())
+        if (needed.isEmpty()) { startKarbys(); startWayHat(); startModelService(); updateDeviceInfo() } else permissions.launch(needed.toTypedArray())
     }
 
     private fun startKarbys() {
         ready = true; paused = false
         ContextCompat.startForegroundService(this, Intent(this, KarbysService::class.java).setAction(KarbysService.ACTION_GREETING))
+    }
+
+    private fun startModelService() {
+        ContextCompat.startForegroundService(this, Intent(this, ModelService::class.java))
+        // Si el modelo ya está descargado, se carga solo al abrir la app.
+        if (ModelService.hasModelFile(this) && !LocalQwen.isLoaded) {
+            ContextCompat.startForegroundService(
+                this, Intent(this, ModelService::class.java).setAction(ModelService.ACTION_LOAD)
+            )
+        }
+    }
+
+    private fun modelButtonLabel(state: String): String = when (state) {
+        ModelService.STATE_NOT_DOWNLOADED ->
+            if (ModelService.hasModelFile(this)) "CARGAR MODELO" else "DESCARGAR MODELO (≈1.6 GB)"
+        ModelService.STATE_DOWNLOAD_FAILED -> "REINTENTAR DESCARGA"
+        ModelService.STATE_LOADING -> "CARGANDO…"
+        ModelService.STATE_LOADED -> "DESCARGAR DE LA MEMORIA"
+        ModelService.STATE_LOAD_FAILED -> "REINTENTAR CARGA"
+        else -> "DESCARGAR MODELO (≈1.6 GB)"
+    }
+
+    private fun modelActionFor(state: String): String = when (state) {
+        ModelService.STATE_NOT_DOWNLOADED ->
+            if (ModelService.hasModelFile(this)) ModelService.ACTION_LOAD else ModelService.ACTION_DOWNLOAD
+        ModelService.STATE_DOWNLOAD_FAILED -> ModelService.ACTION_DOWNLOAD
+        ModelService.STATE_LOADING -> ""
+        ModelService.STATE_LOADED -> ModelService.ACTION_UNLOAD
+        ModelService.STATE_LOAD_FAILED -> ModelService.ACTION_LOAD
+        else -> ModelService.ACTION_DOWNLOAD
+    }
+
+    private fun sendModelAction(action: String) {
+        if (action.isEmpty()) return
+        ContextCompat.startForegroundService(this, Intent(this, ModelService::class.java).setAction(action))
     }
 
     private fun startWayHat() {

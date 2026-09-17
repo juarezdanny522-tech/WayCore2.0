@@ -1,42 +1,21 @@
-import java.util.Properties
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
 
-
-val localProps = Properties()
-val localFile = rootProject.file("local.properties")
-if (localFile.exists()) {
-    localFile.inputStream().use { input ->
-        localProps.load(input)
-    }
-}
-
-val qwenUrlRaw = providers.gradleProperty("QWEN_BASE_URL").orNull
-    ?: localProps.getProperty("QWEN_BASE_URL").orEmpty()
-
-// Mantiene BuildConfig válido aunque la URL haya sido pegada con comillas o saltos de línea.
-val qwenUrl = qwenUrlRaw.trim()
-    .removeSurrounding("\"")
-    .replace("\\", "\\\\")
-    .replace("\"", "\\\"")
-    .replace("\r", "")
-    .replace("\n", "")
-
 android {
     namespace = "com.wayhat.waycore"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.wayhat.waycore"
-        minSdk = 26
+        // 28 porque la librería LiteRT-LM (motor del modelo local) no soporta
+        // versiones anteriores de Android.
+        minSdk = 28
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.6.0"
-        buildConfigField("String", "QWEN_BASE_URL", "\"$qwenUrl\"")
+        versionCode = 8
+        versionName = "0.7.0"
     }
 
     compileOptions {
@@ -66,4 +45,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("org.json:json:20240303")
+    // Motor de inferencia local (Qwen2.5-1.5B). Trae sus librerías nativas
+    // (CPU XNNPACK + GPU) dentro del AAR; no se necesita NDK en el build.
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.11.0")
 }

@@ -1,102 +1,85 @@
-# WayCore + WayHat v0.6.0 — Karbys con Qwen2.5 local (function calling)
+# WayCore + WayHat v0.7.0 — Karbys 100% local en el teléfono
 
-Karbys ya no usa la API de Gemini. El cerebro del asistente es **Qwen2.5-1.5B**
-corriendo en un equipo local de la casa/escuela, servido con **Ollama**.
+Karbys **piensa dentro del mismo celular** donde vive la app. El cerebro es
+**Qwen2.5-1.5B-Instruct** (8-bit, 4096 de contexto) corriendo con
+[LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) de Google — la misma
+librería y el mismo modelo que usa la app oficial *AI Edge Gallery*.
 
-¿Qué cambia?
+- **Sin PC, sin Ollama, sin API key, sin Internet** para conversar: después
+  de descargar el modelo una sola vez, Karbys funciona offline.
+- **Function calling nativo**: la librería inyecta las 5 herramientas de
+  WayHat en el formato que Qwen2.5 conoce, ejecuta la función cuando el
+  modelo la pide y devuelve el resultado hasta que Karbys responde en texto.
+- **Seguridad sin cambios**: todas las herramientas pasan por la lista
+  blanca de `WayHatService` (comandos válidos + confirmación del ESP32). El
+  modelo no puede hacer nada que no esté permitido, aunque se equivoque.
 
-- Sin API key ni Internet para pensar: Karbys "piensa" en la red local.
-  (La app sigue usando la red para otras cosas; el Bluetooth sigue siendo independiente.)
-- El function calling se hace con el protocolo estándar OpenAI-compatible
-  (`/v1/chat/completions` + `tools`), así que si mañana prefieren LM Studio,
-  llama.cpp o vLLM, solo cambia `QWEN_BASE_URL`.
-- Si el servidor local no está encendido, Karbys lo dice con claridad en voz
-  alta y no rompe nada.
-- Todos los comandos de hardware siguen en lista blanca y con confirmación
-  desde el ESP32 (`WayHatService.executeTool`): aunque el modelo se equivoque
-  con los argumentos, solo se ejecutan valores válidos.
+## Requisitos del teléfono
 
-## Requisitos
-
-| Rol | Equipo |
+| Requisito | Detalle |
 | --- | --- |
-| Servidor del modelo | Un PC/tablet en la **misma red Wi-Fi** que el teléfono. Mínimo 8 GB de RAM (CPU). Con GPU va mucho más rápido. |
-| Teléfono | Android 8.0+ con Bluetooth Classic y WayHat vinculados. |
+| Android | 9.0 (API 28) o más |
+| RAM | **6 GB mínimo** (Google lo declara en el modelo), 8 GB recomendado |
+| Almacenamiento | ≈1.7 GB libres para el modelo |
+| Bluetooth | `WayHat-Karbys` vinculado (como antes) |
 
-## 1. Instalar Ollama en el equipo del modelo
+Rendimiento esperado (modelo oficial de Google, benchmark en Samsung S25
+Ultra): ~26 tokens/segundo en CPU, ~27 en GPU; una respuesta corta de
+Karbys tarda unos segundos. La primera carga del modelo toma unos segundos
+también.
 
-- **Windows:** bajar el instalador de `ollama.com` y ejecutarlo.
-- **Linux:** `curl -fsSL https://ollama.com/install.sh | sh`
-- **macOS:** instalador oficial o `brew install ollama`
+## Cómo obtener el APK
 
-Descargar el modelo (≈1 GB, se descarga una sola vez):
+El APK **se genera solo en GitHub Actions** (no se compila nada local):
 
-```bash
-ollama pull qwen2.5:1.5b
-```
+1. En GitHub abre el repo → pestaña **Actions** → workflow **Build APK** →
+   **Run workflow** (o simplemente haz push a `main`).
+2. Espera ~10 minutos. Al terminar aparece una **Release** llamada
+   `apk-<commit>` con el APK para descargar.
+   (También está en *Artifacts* de la corrida, por 90 días.)
+3. Copia el APK al teléfono e instálalo (si es la primera vez, habilita
+   "Instalar apps desconocidas" para el navegador/archivador).
 
-## 2. Permitir conexiones desde el teléfono
+## Cómo usarlo
 
-Ollama solo escucha en el propio equipo por defecto. Hay que abrirlo a la red:
+1. Abre WayCore y da los permisos como siempre.
+2. En la sección **MODELO LOCAL DE KARBYS** pulsa **DESCARGAR MODELO (≈1.6
+   GB)**. Usa Wi-Fi; si se corta, al reintentar **continúa donde quedó**
+   (no vuelve a empezar) y al terminar valida que el archivo es el completo.
+3. Pulsa **CARGAR MODELO** (o simplemente cierra y reabre la app: si el
+   modelo ya está descargado, se carga solo).
+4. Cuando diga "Modelo local listo", Karbys ya piensa en el teléfono.
+   Desde ese momento **no necesita Internet**.
 
-- **Windows:** en el panel de administración de Ollama, o creando una variable
-  de entorno `OLLAMA_HOST=0.0.0.0` y reiniciando Ollama. Asegúrate de que el
-  firewall permita conexiones entrantes en el puerto **11434**.
-- **Linux:** edita `/etc/systemd/system/ollama.service` y agrega
-  `Environment="OLLAMA_HOST=0.0.0.0"`, luego
-  `sudo systemctl daemon-reload && sudo systemctl restart ollama`.
-- **macOS:** `OLLAMA_HOST=0.0.0.0 ollama serve` (o en `launchctl`).
-
-Comprueba la IP del equipo (Windows: `ipconfig`; Linux/macOS: `ip a`).
-Ejemplo: `192.168.1.50`.
-
-## 3. Configurar la app
-
-Copia `local.properties.example` como `local.properties` y pon la IP real:
-
-```properties
-QWEN_BASE_URL=http://192.168.1.50:11434/v1
-```
-
-> No pongas `127.0.0.1`: eso es "el propio teléfono". Tiene que ser la IP del
-> equipo donde corre Ollama.
-
-Construye el APK como siempre (`./gradlew assembleDebug`).
-
-## 4. Probar que funciona (importante)
-
-Antes de armar todo con el teléfono, ejecuta en el equipo de Ollama:
-
-```bash
-python3 scripts/test_qwen_ollama.py --host http://127.0.0.1:11434
-```
-
-El script reproduce exactamente lo que hace la app (mismo prompt, mismas
-herramientas, mismo bucle de function calling) y reporta PASS/FAIL por
-escenario: sensibilidad, modo SAFE/CHAT, avisos, buzzer, lectura de
-telemetría real y conversación sin herramientas. Con el modelo real tardará
-un poco (≈5–20 s por pregunta en CPU; menos con GPU).
-
-## Notas de rendimiento y calidad
-
-- La primera pregunta después de unos 5 min "recarga" el modelo (segundos);
-  Ollama lo mantiene caliente solo para ese lapso.
-- El contexto por defecto de Ollama (4096 tokens) alcanza con holgura para el
-  prompt + herramientas + memoria de Karbys (≈2000 tokens en el peor caso).
-  Si algún día el prompt crece mucho, crea un modelo propio con más contexto:
-  `ollama create qwen2.5:1.5b-waycore` con un Modelfile que incluya
-  `PARAMETER num_ctx 8192`, y apunta `QWEN_BASE_URL` a ese nombre.
-- Temperatura 0.7 y `max_tokens: 512`: respuestas cortas y estables.
-- El cliente incluye un parser de respaldo: si el modelo pequeño imprime la
-  llamada de herramienta como JSON dentro del texto en vez de en
-  `tool_calls`, la app la detecta igual.
-- El 1.5B es bueno para los 5 comandos simples de WayHat y charlas cortas.
-  Si notan que falla seguido con instrucciones largas, `qwen2.5:3b` es el
-  siguiente salto (≈2 GB) y llama a funciones de forma más estable.
+> Si el teléfono tiene poca RAM libre, cargar el modelo puede fallar.
+> Cierra otras apps y vuelve a intentar.
 
 ## Bluetooth
 
 Igual que antes: el teléfono debe tener `WayHat-Karbys` vinculado. WayCore
-abre la conexión SPP automáticamente con el UUID estándar de Bluetooth Classic.
-WayHat mantiene su seguridad local aunque el teléfono o el servidor del
-modelo no estén disponibles.
+abre la conexión SPP automáticamente con el UUID estándar de Bluetooth
+Classic. WayHat mantiene su seguridad local aunque el modelo o el teléfono
+no estén disponibles.
+
+## Arquitectura (resumen)
+
+| Pieza | Archivo |
+| --- | --- |
+| Motor del modelo (LiteRT-LM) + herramientas | `LocalQwen.kt` |
+| Descarga (reanudable + validación), carga, estado | `ModelService.kt` |
+| Voz, oído, memoria, comandos rápidos locales | `KarbysService.kt` |
+| Enlace Bluetooth con WayHat (lista blanca + ack) | `WayHatService.kt` |
+| Pantalla (incluye control del modelo) | `MainActivity.kt` |
+| Build del APK en la nube | `.github/workflows/build-apk.yml` |
+
+## Notas
+
+- El comando literal ("sensibilidad 80", "modo charla", "prueba el buzzer"…)
+  se ejecuta por atajo local sin pasar por el modelo (más rápido); el
+  function calling de Qwen2.5 entra cuando la persona parafrasea.
+- El archivo del modelo vive en `filesDir/qwen2.5-1.5b-instruct-q8-ctx4096.litertlm`;
+  borrarlo (o "Des cargar de la memoria" y borrar datos de la app) lo
+  elimina.
+- Si en el futuro quieren otro tamaño/contexto, solo cambia `MODEL_URL` y
+  `EXPECTED_MODEL_SIZE` en `ModelService.kt` (los archivos oficiales están
+  en `litert-community/Qwen2.5-1.5B-Instruct` de Hugging Face).
