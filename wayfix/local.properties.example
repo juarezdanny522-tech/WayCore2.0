@@ -1,3 +1,12 @@
-# Copia este archivo como local.properties y agrega tu clave de Gemini.
-# No pongas comillas alrededor de la clave.
-GEMINI_API_KEY=TU_CLAVE_DE_GEMINI
+# Copia este archivo como local.properties y ajusta la dirección.
+#
+# QWEN_BASE_URL es la dirección del equipo local que sirve Qwen2.5-1.5B
+# (Ollama por defecto). Debe ser la IP de ESE EQUIPO en la red Wi-Fi,
+# no 127.0.0.1 (esa es "el propio teléfono").
+#
+# Cómo encontrar la IP de tu equipo:
+#   - Windows: cmd -> "ipconfig" (busca "Dirección IPv4")
+#   - macOS/Linux: terminal -> "ip a" o "ifconfig"
+#
+# Ejemplo: QWEN_BASE_URL=http://192.168.1.50:11434/v1
+QWEN_BASE_URL=http://192.168.1.50:11434/v1

@@ -407,7 +407,7 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
         val clean = text.trim()
         scope.launch {
             val direct = executeLocalCommand(clean)
-            val answer = direct ?: GeminiClient.ask(clean, memory.toList(), buildDeviceContext())
+            val answer = direct ?: QwenClient.ask(clean, memory.toList(), buildDeviceContext())
             memory.add(ConversationTurn(clean, answer))
             while (memory.size > 4) memory.removeAt(0)
             withContext(Dispatchers.Main) {

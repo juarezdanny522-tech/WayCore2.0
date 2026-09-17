@@ -15,11 +15,11 @@ if (localFile.exists()) {
     }
 }
 
-val geminiKeyRaw = providers.gradleProperty("GEMINI_API_KEY").orNull
-    ?: localProps.getProperty("GEMINI_API_KEY").orEmpty()
+val qwenUrlRaw = providers.gradleProperty("QWEN_BASE_URL").orNull
+    ?: localProps.getProperty("QWEN_BASE_URL").orEmpty()
 
-// Mantiene BuildConfig válido aunque la clave haya sido pegada con comillas o saltos de línea.
-val geminiKey = geminiKeyRaw.trim()
+// Mantiene BuildConfig válido aunque la URL haya sido pegada con comillas o saltos de línea.
+val qwenUrl = qwenUrlRaw.trim()
     .removeSurrounding("\"")
     .replace("\\", "\\\\")
     .replace("\"", "\\\"")
@@ -34,9 +34,9 @@ android {
         applicationId = "com.wayhat.waycore"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.3.0"
-        buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
+        versionCode = 7
+        versionName = "0.6.0"
+        buildConfigField("String", "QWEN_BASE_URL", "\"$qwenUrl\"")
     }
 
     compileOptions {
