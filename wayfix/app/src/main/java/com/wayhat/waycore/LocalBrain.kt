@@ -36,12 +36,25 @@ object LocalBrain {
 
     private fun createEngine(context: Context): Engine {
         val file = ModelManager.modelFile(context)
-        if (!file.isFile) throw LocalError("El modelo todavía no está descargado en el teléfono.")
+        if (!file.isFile) throw LocalError("El modelo todavía no está descargado en el teléfono. Ve a Ajustes y toca DESCARGAR IA. Es de ${ModelManager.specFor(context).megabytes} MB y se guarda en el teléfono, no dentro del APK.")
 
-        val wanted = if (Prefs.useGpu(context)) listOf(Backend.GPU(), Backend.CPU()) else listOf(Backend.CPU())
+        // Asegurar que el cacheDir existe y es escribible (algunos gama media tienen cache encriptado)
+        try {
+            val cache = context.cacheDir
+            if (!cache.exists()) cache.mkdirs()
+            // Limpiar cache vieja si hay poco espacio
+            if (cache.freeSpace < 200 * 1024 * 1024) {
+                cache.listFiles()?.forEach { if (it.isFile && it.name.startsWith("litert")) try { it.delete() } catch (_: Exception) {} }
+            }
+        } catch (_: Exception) {}
+
+        // Para gama media-alta: siempre intentar CPU primero si GPU está desactivado, y con fallback robusto
+        val wanted = if (Prefs.useGpu(context)) listOf(Backend.GPU(), Backend.CPU()) else listOf(Backend.CPU(), Backend.GPU())
         var last: Throwable? = null
+        var lastBackend = "desconocido"
         for (backend in wanted) {
             try {
+                lastBackend = if (backend is Backend.GPU) "GPU" else "CPU"
                 val candidate = Engine(
                     EngineConfig(
                         modelPath = file.absolutePath,
@@ -53,12 +66,19 @@ object LocalBrain {
                 return candidate
             } catch (t: Throwable) {
                 last = t
+                // Si GPU falla, seguir a CPU sin asustar al usuario
+                continue
             }
         }
-        throw LocalError(
-            "No se pudo cargar el modelo en este teléfono. " +
-                (last?.message?.take(160) ?: "error desconocido")
-        )
+        // Mensaje específico para gama media
+        val ram = ModelManager.totalRamMegabytes(context)
+        val is64 = ModelManager.hasCpuForEngine(context)
+        val extra = when {
+            !is64 -> " Tu teléfono es de 32 bits y el motor local solo corre en 64 bits. Usa modo NUBE con Gemini, que ya está arreglado para tu gama media."
+            ram in 1..2499 -> " Tu teléfono tiene $ram MB de RAM. El modelo pide ${ModelManager.specFor(context).minRamMegabytes} MB. Prueba Qwen 0.5B (491 MB) que es para gama media."
+            else -> " Backend probado: $lastBackend. Error: ${(last?.message?.take(200) ?: last?.javaClass?.simpleName ?: "desconocido")}. Si usas GPU, desactívalo en ajustes."
+        }
+        throw LocalError("No se pudo cargar el modelo en este teléfono.$extra")
     }
 
     private suspend fun ensureEngine(context: Context): Engine {
@@ -154,12 +174,19 @@ object LocalBrain {
     /** Hilos razonables para no dejar al audio y a la interfaz sin CPU. */
     fun suggestedThreads(): Int = Runtime.getRuntime().availableProcessors().let { cores ->
         when {
-            cores <= 2 -> 2
-            cores <= 5 -> 3
-            else -> 4
+            cores <= 2 -> 1 // Gama baja: 1 hilo para no congelar
+            cores <= 4 -> 2 // Gama media: 2 hilos
+            cores <= 6 -> 3 // Gama media-alta: 3 hilos
+            else -> 4 // Gama alta: 4 hilos
         }
     }
 
     fun deviceSummary(): String =
         "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.SDK_INT} · ${suggestedThreads()} hilos"
+
+    fun deviceSummary(context: Context): String {
+        val ram = ModelManager.totalRamMegabytes(context)
+        val arch = if (ModelManager.hasCpuForEngine(context)) "64-bit ✓" else "32-bit ✗"
+        return "${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.SDK_INT} · ${suggestedThreads()} hilos · $arch · $ram MB RAM · ${if (ram >= 3500) "gama media-alta compatible" else "considera modelo 0.5B"}"
+    }
 }

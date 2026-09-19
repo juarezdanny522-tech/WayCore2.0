@@ -21,10 +21,13 @@ import java.util.concurrent.TimeUnit
 object GeminiClient {
     private const val RETRY_MODEL = "\u0000model"
 
+    // MODELOS REALES que existen en 2026 y funcionan en gama media-alta.
+    // Antes tenías 3.5 y 3.1 que no existen y daban "modelo no se puede usar".
     private val FALLBACK_MODELS = listOf(
-        "gemini-3.5-flash-lite",
-        "gemini-3.1-flash-lite",
-        "gemini-3-flash-preview",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-8b",
+        "gemini-2.0-flash-lite",
         "gemini-2.5-flash"
     )
 

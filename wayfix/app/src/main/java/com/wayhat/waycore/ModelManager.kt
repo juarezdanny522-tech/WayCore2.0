@@ -153,21 +153,49 @@ object ModelManager {
      * arm64-v8a; para armeabi-v7a no existe). Comprobarlo antes de descargar evita gastar un
      * gigabyte de datos para descubrir después que el teléfono no puede cargarlo.
      */
-    fun hasCpuForEngine(context: Context): Boolean =
-        Build.SUPPORTED_ABIS.any { it.startsWith("arm64") || it == "x86_64" || it == "riscv64" }
+    fun hasCpuForEngine(context: Context): Boolean {
+        return Build.SUPPORTED_ABIS.any { abi ->
+            abi.startsWith("arm64") || abi == "x86_64" || abi == "riscv64" || abi.contains("64")
+        }
+    }
 
-    fun fitsOnThisPhone(context: Context): Boolean =
-        hasCpuForEngine(context) && totalRamMegabytes(context) >= specFor(context).minRamMegabytes
+    // Para gama media-alta permitimos descargar aunque la RAM esté justa, con advertencia.
+    // Un celular de 6GB sí puede usar Q4_K_M si cierra apps.
+    fun fitsOnThisPhone(context: Context): Boolean {
+        if (!hasCpuForEngine(context)) return false
+        val ram = totalRamMegabytes(context)
+        // Solo bloqueamos si es < 2.5GB o 32-bit. Si es 3GB+ permitimos con aviso.
+        if (ram in 1..2499) return false
+        return true
+    }
 
     fun reasonItDoesNotFit(context: Context): String {
         val ram = totalRamMegabytes(context)
         val needed = specFor(context).minRamMegabytes
+        val free = freeMegabytes(context)
         return when {
             !hasCpuForEngine(context) ->
-                "Este teléfono es de 32 bits y el motor de IA local solo corre en 64 bits. Karbys puede seguir usando la nube."
-            ram in 1 until needed ->
-                "Este teléfono tiene $ram megabytes de memoria y el modelo pide unos $needed. Prueba con la versión Q2 o con la de quinientos millones de parámetros."
-            else -> "No hay suficiente sitio libre para el modelo."
+                "Este teléfono es de 32 bits (${Build.SUPPORTED_ABIS.joinToString()}) y el motor de IA local solo corre en 64 bits. Pero no te preocupes: Karbys puede seguir usando la nube con Gemini, que ya está arreglado para tu gama media-alta y no necesita descargar nada."
+            ram in 1..2499 ->
+                "Este teléfono tiene $ram MB de RAM y el modelo ${specFor(context).fileName} pide unos $needed MB. Para tu gama media-alta te recomiendo Qwen 0.5B (491 MB, pide 2500 MB) o Qwen 1.5B Q2 (752 MB, pide 2900 MB). Tócale a OTRA VERSIÓN DEL MODELO."
+            free < 500 ->
+                "Solo te quedan $free MB libres y necesitas ${specFor(context).megabytes} MB. Libera espacio o usa modo NUBE que no descarga nada."
+            ram in 2500 until needed ->
+                "Tu teléfono tiene $ram MB y el modelo pide $needed MB. En gama media-alta suele funcionar si cierras otras apps, pero si falla prueba Q2 o 0.5B. ¿Quieres que lo descargue igual? Si se cierra, cambia a 0.5B."
+            else -> "No hay suficiente sitio libre para el modelo. Libera ${specFor(context).megabytes} MB o usa modo NUBE."
+        }
+    }
+
+    // Sugiere el mejor modelo para este teléfono automáticamente - ideal para gama media-alta
+    fun bestModelForThisPhone(context: Context): ModelSpec {
+        val ram = totalRamMegabytes(context)
+        val is64 = hasCpuForEngine(context)
+        if (!is64) return SPECS.last()
+        return when {
+            ram >= 5500 -> SPECS[0] // Q4_K_M para 6GB+
+            ram >= 4000 -> SPECS[1] // Q3 para 4-6GB (gama media-alta ideal)
+            ram >= 3000 -> SPECS[2] // Q2 para 3-4GB
+            else -> SPECS[3] // 0.5B para <3GB
         }
     }
 
