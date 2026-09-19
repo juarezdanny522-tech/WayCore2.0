@@ -38,47 +38,107 @@ object LocalBrain {
         val file = ModelManager.modelFile(context)
         if (!file.isFile) throw LocalError("El modelo todavía no está descargado en el teléfono. Ve a Ajustes y toca DESCARGAR IA. Es de ${ModelManager.specFor(context).megabytes} MB y se guarda en el teléfono, no dentro del APK.")
 
+        // Validación previa para gama media-alta: verificar que el archivo sea GGUF válido
+        if (file.length() < 100 * 1024 * 1024) {
+            throw LocalError("El archivo del modelo está incompleto (${file.length() / 1024 / 1024} MB). Borra y vuelve a descargar. El modelo debe pesar ${ModelManager.specFor(context).megabytes} MB.")
+        }
+
+        // Verificar magic bytes GGUF
+        try {
+            file.inputStream().use { input ->
+                val magic = ByteArray(4)
+                if (input.read(magic) == 4) {
+                    val magicStr = String(magic, Charsets.US_ASCII)
+                    if (magicStr != "GGUF") {
+                        // Puede ser archivo HTML de error de HuggingFace o archivo corrupto
+                        val firstKb = ByteArray(1024)
+                        file.inputStream().use { it.read(firstKb) }
+                        val preview = String(firstKb, Charsets.UTF_8).take(200)
+                        if (preview.contains("<html", true) || preview.contains("<!DOCTYPE", true)) {
+                            throw LocalError("El archivo descargado no es un modelo, es una página de error de HuggingFace. Borra el modelo y descarga de nuevo con buena conexión. Si sigue fallando, usa modo NUBE con Gemini que ya está arreglado.")
+                        }
+                        throw LocalError("El archivo no parece ser GGUF válido (magic=$magicStr). Puede estar corrupto. Borra y descarga de nuevo. Si usas Q4_K_M prueba Q2 o 0.5B que son más compatibles con gama media.")
+                    }
+                }
+            }
+        } catch (e: LocalError) { throw e } catch (_: Exception) {}
+
         // Asegurar que el cacheDir existe y es escribible (algunos gama media tienen cache encriptado)
         try {
             val cache = context.cacheDir
             if (!cache.exists()) cache.mkdirs()
-            // Limpiar cache vieja si hay poco espacio
             if (cache.freeSpace < 200 * 1024 * 1024) {
                 cache.listFiles()?.forEach { if (it.isFile && it.name.startsWith("litert")) try { it.delete() } catch (_: Exception) {} }
             }
         } catch (_: Exception) {}
 
-        // Para gama media-alta: siempre intentar CPU primero si GPU está desactivado, y con fallback robusto
-        val wanted = if (Prefs.useGpu(context)) listOf(Backend.GPU(), Backend.CPU()) else listOf(Backend.CPU(), Backend.GPU())
+        // Para gama media-alta: probar CPU primero SIEMPRE, GPU solo si el usuario lo activó y como fallback
+        // El error "Unsupported file format" suele pasar con GPU en algunos Adreno/Mali
+        val wanted = if (Prefs.useGpu(context)) {
+            listOf(Backend.GPU(), Backend.CPU())
+        } else {
+            listOf(Backend.CPU()) // Solo CPU para máxima compatibilidad en gama media-alta
+        }
+
         var last: Throwable? = null
         var lastBackend = "desconocido"
+        val errors = mutableListOf<String>()
+
         for (backend in wanted) {
             try {
-                lastBackend = if (backend is Backend.GPU) "GPU" else "CPU"
-                val candidate = Engine(
-                    EngineConfig(
-                        modelPath = file.absolutePath,
-                        backend = backend,
-                        cacheDir = context.cacheDir.path
-                    )
+                lastBackend = when (backend) {
+                    is Backend.GPU -> "GPU"
+                    else -> "CPU"
+                }
+
+                // Configuración más conservadora para gama media
+                val config = EngineConfig(
+                    modelPath = file.absolutePath,
+                    backend = backend,
+                    cacheDir = context.cacheDir.path
                 )
+
+                val candidate = Engine(config)
                 candidate.initialize()
                 return candidate
             } catch (t: Throwable) {
                 last = t
-                // Si GPU falla, seguir a CPU sin asustar al usuario
+                val msg = t.message ?: t.javaClass.simpleName
+                errors.add("$lastBackend: $msg")
+                // Si es error de formato, no tiene sentido probar GPU, solo CPU
+                if (msg.contains("format", true) || msg.contains("INVALID_ARGUMENT", true) || msg.contains("Unsupported", true)) {
+                    // Si ya probamos CPU y falló por formato, es archivo corrupto o cuantización no soportada
+                    if (lastBackend == "CPU") {
+                        break
+                    }
+                }
                 continue
             }
         }
-        // Mensaje específico para gama media
+
+        // Mensaje específico para el error que reportaste
         val ram = ModelManager.totalRamMegabytes(context)
         val is64 = ModelManager.hasCpuForEngine(context)
+        val fileName = file.name
+
+        val detailedError = errors.joinToString("; ")
+
         val extra = when {
-            !is64 -> " Tu teléfono es de 32 bits y el motor local solo corre en 64 bits. Usa modo NUBE con Gemini, que ya está arreglado para tu gama media."
-            ram in 1..2499 -> " Tu teléfono tiene $ram MB de RAM. El modelo pide ${ModelManager.specFor(context).minRamMegabytes} MB. Prueba Qwen 0.5B (491 MB) que es para gama media."
-            else -> " Backend probado: $lastBackend. Error: ${(last?.message?.take(200) ?: last?.javaClass?.simpleName ?: "desconocido")}. Si usas GPU, desactívalo en ajustes."
+            detailedError.contains("format", true) || detailedError.contains("Unsupported", true) || detailedError.contains("unknown file", true) -> {
+                """
+                El modelo $fileName no se pudo abrir (formato no soportado). Esto pasa por:
+                1. Archivo corrupto/incompleto -> Borra y descarga de nuevo
+                2. Cuantización Q4_K_M no soportada en LiteRT-LM 0.17.1 en tu GPU ${Build.MANUFACTURER} -> Desactiva GPU en ajustes y usa solo CPU, o prueba Q2 o 0.5B que son más compatibles
+                3. Modelo de HuggingFace incompatible -> Prueba Qwen 0.5B que pesa 491MB y es 100% compatible con gama media-alta
+                4. Usa modo NUBE con Gemini (ya arreglado con modelos 2.0-flash) mientras tanto - no necesita descargar nada
+                Error técnico: $detailedError
+                """.trimIndent()
+            }
+            !is64 -> " Tu teléfono es de 32 bits y el motor local solo corre en 64 bits. Usa modo NUBE con Gemini, que ya está arreglado para tu gama media y no necesita descargar nada. Error: $detailedError"
+            ram in 1..2499 -> " Tu teléfono tiene $ram MB de RAM. El modelo pide ${ModelManager.specFor(context).minRamMegabytes} MB. Prueba Qwen 0.5B (491 MB) que es para gama media. Error: $detailedError"
+            else -> " Backend probado: $lastBackend. Error: $detailedError. Si usas GPU, desactívalo en ajustes y prueba solo CPU. También prueba OTRA VERSIÓN DEL MODELO con Q2 o 0.5B."
         }
-        throw LocalError("No se pudo cargar el modelo en este teléfono.$extra")
+        throw LocalError("No se pudo cargar el modelo en este teléfono. $extra")
     }
 
     private suspend fun ensureEngine(context: Context): Engine {

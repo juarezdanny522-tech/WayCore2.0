@@ -576,17 +576,45 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
 
         var finalAnswer = answer.trim()
         if (finalAnswer.isBlank() && failure == null) {
-            // Sin texto y sin excepción: el modelo se quedó en blanco o solo emitió la orden.
             finalAnswer = if (executed.isNotBlank()) "Listo, ya lo apliqué al sombrero."
             else "No pude armar una respuesta con el modelo del teléfono. Intenta más despacio o dime el comando directo."
         }
         if (finalAnswer.isBlank() && failure != null) {
             LocalBrain.unload()
+            // Si es error de formato, dar instrucciones específicas para gama media-alta
+            val isFormatError = failure.contains("format", true) || failure.contains("INVALID_ARGUMENT", true) || failure.contains("Unsupported", true) || failure.contains("unknown file", true)
+            if (isFormatError) {
+                val advice = if (Prefs.hasApiKey(ctx)) {
+                    "El modelo local ${ModelManager.specFor(ctx).fileName} no es compatible con tu teléfono (${failure.take(120)}). Te recomiendo: 1) Borra el modelo y descarga Qwen 0.5B que es 100% compatible con gama media, 2) Desactiva GPU en ajustes, 3) Mientras tanto uso la nube con Gemini que ya está arreglado y no necesita descargar nada. Pasando a la nube..."
+                } else {
+                    "El modelo local falló por formato no soportado: ${failure.take(120)}. Borra el modelo en ajustes y descarga Qwen 0.5B de 491MB que es el más compatible con gama media-alta, o guarda una clave de Gemini para usar la nube que ya funciona sin descargar nada. Los comandos del sombrero sí funcionan."
+                }
+                withContext(Dispatchers.Main) { publishUiEvent("Error de formato: $failure", false) }
+                if (Prefs.hasApiKey(ctx) && !isFormatError) {
+                    // Solo pasar a nube automáticamente si no es error de formato grave, para no gastar datos
+                    withContext(Dispatchers.Main) { publishUiEvent("El cerebro local falló; paso a la nube…", false) }
+                    speakWithGemini(userText)
+                    return
+                } else if (Prefs.hasApiKey(ctx)) {
+                    // Si es error de formato pero hay API key, igual pasar a nube
+                    withContext(Dispatchers.Main) { processing = false; speak(advice) }
+                    // Intentar Gemini después del aviso
+                    scope.launch {
+                        delay(1000)
+                        speakWithGemini(userText)
+                    }
+                    return
+                } else {
+                    withContext(Dispatchers.Main) { processing = false; speak(advice) }
+                    return
+                }
+            }
+
             if (Prefs.hasApiKey(ctx)) {
                 withContext(Dispatchers.Main) { publishUiEvent("El cerebro local falló; paso a la nube…", false) }
                 speakWithGemini(userText)
             } else {
-                withContext(Dispatchers.Main) { processing = false; speak("El cerebro local falló: $failure.") }
+                withContext(Dispatchers.Main) { processing = false; speak("El cerebro local falló: $failure. Borra y descarga Qwen 0.5B que es más compatible, o usa modo NUBE con Gemini.") }
             }
             return
         }
