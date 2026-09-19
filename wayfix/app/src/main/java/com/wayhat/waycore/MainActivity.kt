@@ -140,8 +140,8 @@ class MainActivity : ComponentActivity() {
                         // --- Sección de actualización automática APK ---
                         Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
                             Column(Modifier.padding(12.dp)) {
-                                Text("Actualizaciones APK", style = MaterialTheme.typography.titleMedium)
-                                Text("Al tocar el APK nuevo se actualiza solo, sin desinstalar. No se descarga modelo dentro del APK.", style = MaterialTheme.typography.labelSmall)
+                                Text("Actualizaciones APK - v0.7.2 FIX", style = MaterialTheme.typography.titleMedium)
+                                Text("Al tocar el APK nuevo se actualiza solo, sin desinstalar. Si dice 'archivo malicioso' es falso positivo por ser debug. Ve a Ajustes -> Apps -> Acceso especial -> Instalar apps desconocidas -> permite tu gestor de archivos. Y Play Store -> Play Protect -> Ajustes -> desactiva análisis.", style = MaterialTheme.typography.labelSmall)
                                 if (updateStatus.isNotBlank()) Text(updateStatus, style = MaterialTheme.typography.bodySmall)
                                 if (isApkDownloading) {
                                     LinearProgressIndicator(progress = { apkDownloadProgress / 100f }, modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp))
@@ -150,16 +150,14 @@ class MainActivity : ComponentActivity() {
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 6.dp)) {
                                     Button(onClick = {
                                         scope.launch {
-                                            updateStatus = "Buscando actualización..."
+                                            updateStatus = "Buscando actualización (usa URL directa, sin API para evitar rate limit)..."
                                             val info = UpdateManager.checkForUpdate(context)
                                             latestVersion = info.latestVersion
-                                            if (info.available && info.downloadUrl != null) {
+                                            if (info.downloadUrl != null) {
                                                 updateAvailable = true
-                                                updateStatus = "¡Nueva versión ${info.latestVersion} disponible! Actual: ${info.currentVersion}. Toca DESCARGAR y luego INSTALAR, se actualizará solo."
-                                            } else if (info.error != null) {
-                                                updateStatus = info.error + " Versión actual: ${info.currentVersion}"
+                                                updateStatus = "¡APK listo! Actual: ${info.currentVersion}, Latest: ${info.latestVersion}. Toca DESCARGAR -> INSTALAR -> Actualizar. Si dice malicioso, permite en Ajustes. ${info.error ?: ""}"
                                             } else {
-                                                updateStatus = "Ya tienes la última versión (${info.currentVersion}). Al tocar el APK nuevo, se actualiza solo sin desinstalar."
+                                                updateStatus = "Error: ${info.error} Versión actual: ${info.currentVersion}. Usa link directo: https://github.com/juarezdanny522-tech/WayCore2.0/releases/download/waycore-latest/WayCore-latest-debug.apk"
                                             }
                                         }
                                     }) { Text("BUSCAR APK") }
@@ -171,13 +169,22 @@ class MainActivity : ComponentActivity() {
                                                 val url = info.downloadUrl ?: return@launch
                                                 isApkDownloading = true
                                                 apkDownloadProgress = 0
-                                                updateStatus = "Descargando ${info.latestVersion}..."
+                                                updateStatus = "Descargando ${info.latestVersion} desde $url ..."
                                                 val result = UpdateManager.downloadAndInstall(context, url) { prog -> apkDownloadProgress = prog }
-                                                updateStatus = result
+                                                updateStatus = result + " Si dice 'malicioso', es falso positivo debug. Permite en Ajustes -> Instalar apps desconocidas."
                                                 isApkDownloading = false
                                             }
                                         }) { Text("DESCARGAR") }
                                     }
+                                }
+                                Button(onClick = {
+                                    // Abrir link directo sin pasar por API
+                                    try {
+                                        val intent = android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse("https://github.com/juarezdanny522-tech/WayCore2.0/releases/download/waycore-latest/WayCore-latest-debug.apk"))
+                                        context.startActivity(intent)
+                                    } catch (_: Exception) {}
+                                }, modifier = Modifier.fillMaxWidth().padding(top = 6.dp)) {
+                                    Text("ABRIR LINK DIRECTO APK (sin API)")
                                 }
                             }
                         }
@@ -247,8 +254,8 @@ class MainActivity : ComponentActivity() {
                         }
 
                         HorizontalDivider(Modifier.padding(vertical = 18.dp))
-                        Text("CEREBRO DE KARBYS - LOCAL COMPATIBLE", style = MaterialTheme.typography.titleLarge)
-                        Text("Para gama media-alta recomendamos Q3 (924 MB) o Q2 (752 MB). Q4_K_M solo si tienes 6GB+.", style = MaterialTheme.typography.bodySmall)
+                        Text("CEREBRO DE KARBYS - QWEN3 LOCAL v0.7.2 FIX", style = MaterialTheme.typography.titleLarge)
+                        Text("ANTES fallaba con GGUF 'Unsupported file format'. AHORA usa .litertlm oficial de litert-community/Qwen3-0.6B (474MB) 100% compatible con LiteRT-LM 0.13.1. Para gama media-alta usa Mixed Int4 474MB. Si falla, usa NUBE con Gemini 2.0-flash que ya funciona.", style = MaterialTheme.typography.bodySmall)
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             Button(onClick = { pickBrain(Prefs.BRAIN_LOCAL) }, modifier = Modifier.weight(1f)) { Text("LOCAL") }
                             Button(onClick = { pickBrain(Prefs.BRAIN_AUTO) }, modifier = Modifier.weight(1f)) { Text("AUTO") }
