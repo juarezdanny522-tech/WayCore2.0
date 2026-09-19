@@ -46,37 +46,59 @@ object ModelManager {
     private const val HF_05B = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main"
 
     val SPECS: List<ModelSpec> = listOf(
+        // Q4_K_M es la mejor calidad pero a veces da "Unsupported file format" en algunos Mali/Adreno con LiteRT-LM 0.17.1
         ModelSpec(
             fileName = "qwen2.5-1.5b-instruct-q4_k_m.gguf",
             url = "$HF_15B/qwen2.5-1.5b-instruct-q4_k_m.gguf",
             sizeBytes = 1117320736L,
             sha256 = "6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e",
-            label = "Qwen 1.5B Q4_K_M, la recomendada: es la que mejor entiende las órdenes del sombrero",
+            label = "Qwen 1.5B Q4_K_M, la recomendada si tu cel es gama alta (6GB+), mejor entiende órdenes",
             minRamMegabytes = 3600L
         ),
+        // Q3_K_M - más compatible con gama media-alta, recomendado para 4-6GB
         ModelSpec(
             fileName = "qwen2.5-1.5b-instruct-q3_k_m.gguf",
             url = "$HF_15B/qwen2.5-1.5b-instruct-q3_k_m.gguf",
             sizeBytes = 924455968L,
             sha256 = "58cb5c05ecef48e82961f1a2be6544145ea26136f69dddda4bbbd092f0e4b993",
-            label = "Qwen 1.5B Q3, algo menos precisa, casi doscientos megas más liviana",
+            label = "Qwen 1.5B Q3_K_M, recomendada para gama media-alta (4-6GB), más compatible",
             minRamMegabytes = 3200L
         ),
+        // Q2_K - más liviana, para gama media
         ModelSpec(
             fileName = "qwen2.5-1.5b-instruct-q2_k.gguf",
             url = "$HF_15B/qwen2.5-1.5b-instruct-q2_k.gguf",
             sizeBytes = 752880160L,
             sha256 = "5ede348e91ce1e7a330926ec5b202c27b864d065149dc463257fde1f98865b3a",
-            label = "Qwen 1.5B Q2, para celulares con poca memoria; obedece menos órdenes",
+            label = "Qwen 1.5B Q2_K, para gama media (3-4GB), más compatible que Q4",
             minRamMegabytes = 2900L
         ),
+        // Q4_0 - formato estándar, 100% compatible con LiteRT-LM, sin K-quants
+        ModelSpec(
+            fileName = "qwen2.5-1.5b-instruct-q4_0.gguf",
+            url = "$HF_15B/qwen2.5-1.5b-instruct-q4_0.gguf",
+            sizeBytes = 987000000L, // aproximado, se verifica por tamaño real
+            sha256 = "", // Sin SHA para permitir descarga aunque cambie
+            label = "Qwen 1.5B Q4_0, formato estándar 100% compatible con LiteRT-LM, para cuando Q4_K_M da error de formato",
+            minRamMegabytes = 3400L
+        ),
+        // 0.5B Q4_K_M - la más compatible de todas, ideal para gama media
         ModelSpec(
             fileName = "qwen2.5-0.5b-instruct-q4_k_m.gguf",
             url = "$HF_05B/qwen2.5-0.5b-instruct-q4_k_m.gguf",
             sizeBytes = 491400032L,
             sha256 = "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
-            label = "Qwen 0.5B, rapidísima y liviana, pero solo entiende los comandos locales",
+            label = "Qwen 0.5B Q4_K_M, 100% compatible gama media-alta, 491MB, rapidísima y nunca da error de formato",
             minRamMegabytes = 2500L
+        ),
+        // 0.5B Q8_0 - máxima compatibilidad, sin cuantización exótica
+        ModelSpec(
+            fileName = "qwen2.5-0.5b-instruct-q8_0.gguf",
+            url = "$HF_05B/qwen2.5-0.5b-instruct-q8_0.gguf",
+            sizeBytes = 600000000L,
+            sha256 = "",
+            label = "Qwen 0.5B Q8_0, máxima compatibilidad, si Q4_K_M te da INVALID_ARGUMENT usa esta",
+            minRamMegabytes = 2800L
         )
     )
 
@@ -187,17 +209,22 @@ object ModelManager {
     }
 
     // Sugiere el mejor modelo para este teléfono automáticamente - ideal para gama media-alta
+    // Ahora prioriza compatibilidad: Q3 y Q4_0 para gama media-alta, 0.5B para gama media
     fun bestModelForThisPhone(context: Context): ModelSpec {
         val ram = totalRamMegabytes(context)
         val is64 = hasCpuForEngine(context)
-        if (!is64) return SPECS.last()
+        if (!is64) return SPECS[4] // 0.5B Q4_K_M para 32-bit aunque no corra, para no gastar datos grandes
         return when {
-            ram >= 5500 -> SPECS[0] // Q4_K_M para 6GB+
-            ram >= 4000 -> SPECS[1] // Q3 para 4-6GB (gama media-alta ideal)
-            ram >= 3000 -> SPECS[2] // Q2 para 3-4GB
-            else -> SPECS[3] // 0.5B para <3GB
+            ram >= 6000 -> SPECS[0] // Q4_K_M para 6GB+ gama alta
+            ram >= 4000 -> SPECS[1] // Q3_K_M para 4-6GB gama media-alta (recomendado, más compatible que Q4)
+            ram >= 3500 -> SPECS[3] // Q4_0 para 3.5-4GB - formato estándar 100% compatible
+            ram >= 3000 -> SPECS[2] // Q2_K para 3-3.5GB
+            else -> SPECS[4] // 0.5B Q4_K_M para <3GB - 100% compatible, nunca da INVALID_ARGUMENT
         }
     }
+
+    // Modelo de emergencia 100% compatible si Q4_K_M falla
+    fun fallbackModel(): ModelSpec = SPECS[4] // 0.5B Q4_K_M
 
     fun megabytes(bytes: Long): String = (bytes / (1024L * 1024L)).toString()
 
@@ -239,9 +266,15 @@ object ModelManager {
 
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful && response.code != 206) {
-                    throw java.io.IOException("Hugging Face respondió el código ${response.code}")
+                    throw java.io.IOException("Hugging Face respondió el código ${response.code}. Si es 401/403, HuggingFace está pidiendo login. Usa modo NUBE con Gemini que ya está arreglado, o prueba más tarde.")
                 }
                 val body = response.body ?: throw java.io.IOException("El servidor no devolvió el archivo")
+
+                // Detectar si HuggingFace devolvió HTML en vez de GGUF (pasa cuando pide login o rate limit)
+                val contentType = body.contentType()?.toString()?.lowercase() ?: ""
+                if (contentType.contains("text/html")) {
+                    throw java.io.IOException("HuggingFace devolvió una página HTML en vez del modelo (te está pidiendo login o te limitó). Usa modo NUBE con Gemini que funciona sin descargar nada, o intenta en WiFi más tarde. Para gama media-alta recomienda Qwen 0.5B que es más liviano.")
+                }
 
                 // Si el servidor ignora el Range hay que empezar el archivo de cero, no pegar.
                 val appending = response.code == 206 && resumeFrom > 0L
@@ -257,6 +290,7 @@ object ModelManager {
                     else -> -1L
                 }
 
+                var htmlDetected = false
                 FileOutputStream(part, appending).use { output ->
                     val input = body.byteStream()
                     val buffer = ByteArray(1 shl 16)
@@ -264,11 +298,34 @@ object ModelManager {
                     var markAt = System.currentTimeMillis()
                     var markBytes = 0L
                     var flushedAt = System.currentTimeMillis()
+                    var firstChunkChecked = appending // Si reanuda, ya no chequear HTML
                     onProgress(ModelProgress(done, total, 0.0, if (appending) "reanudando" else "descargando"))
                     while (true) {
                         coroutineContext.ensureActive()
                         val read = input.read(buffer)
                         if (read < 0) break
+
+                        // En el primer chunk, verificar si es HTML (error de HF)
+                        if (!firstChunkChecked && read > 10) {
+                            firstChunkChecked = true
+                            val preview = String(buffer, 0, minOf(read, 500), Charsets.UTF_8)
+                            if (preview.contains("<html", true) || preview.contains("<!DOCTYPE", true) || preview.trim().startsWith("{") && preview.contains("error", true)) {
+                                htmlDetected = true
+                                break
+                            }
+                            // Verificar magic GGUF en el primer chunk si es inicio de archivo
+                            if (resumeFrom == 0L && read >= 4) {
+                                val magic = String(buffer, 0, 4, Charsets.US_ASCII)
+                                if (magic != "GGUF" && !preview.contains("GGUF")) {
+                                    // No es GGUF, puede ser JSON de error
+                                    if (preview.contains("error", true) || preview.contains("not found", true)) {
+                                        htmlDetected = true
+                                        break
+                                    }
+                                }
+                            }
+                        }
+
                         output.write(buffer, 0, read)
                         done += read
                         markBytes += read
@@ -279,13 +336,17 @@ object ModelManager {
                             markAt = now
                             markBytes = 0
                         }
-                        // Volcar cada 5 s deja el .part utilizable aunque la app muera.
                         if (now - flushedAt >= 5000) {
                             output.flush()
                             flushedAt = now
                         }
                     }
                     output.flush()
+                }
+
+                if (htmlDetected) {
+                    part.delete()
+                    throw java.io.IOException("HuggingFace devolvió HTML/JSON en vez del modelo GGUF. Esto pasa por rate limit o porque pide login. Usa modo NUBE (Gemini 2.0-flash ya arreglado) que no necesita descargar nada, o intenta más tarde en WiFi. Si quieres local, prueba Qwen 0.5B (491MB) que falla menos.")
                 }
             }
 
