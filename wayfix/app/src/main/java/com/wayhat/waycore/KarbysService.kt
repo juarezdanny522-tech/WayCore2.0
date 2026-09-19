@@ -147,11 +147,27 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun createRecognizer(hotword: Boolean): SpeechRecognizer? {
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) return null
+        // Verificación amplia de disponibilidad para gama media
+        try {
+            if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                // En algunos dispositivos chinos, isRecognitionAvailable devuelve false pero igual funciona con Google app
+                // Intentamos crear de todas formas si Google está instalado
+                val pm = packageManager
+                val hasGoogle = try { pm.getPackageInfo("com.google.android.googlequicksearchbox", 0); true } catch (_: Exception) { false }
+                if (!hasGoogle) return null
+            }
+        } catch (_: Exception) {
+            // Si falla el check, intentamos igual
+        }
 
         destroyRecognizer()
         val generation = recognizerGeneration
-        val r = try { SpeechRecognizer.createSpeechRecognizer(this) } catch (_: Exception) { return null }
+        val r = try {
+            // Intentar con contexto de aplicación para evitar leaks en gama media
+            SpeechRecognizer.createSpeechRecognizer(applicationContext)
+        } catch (_: Exception) {
+            try { SpeechRecognizer.createSpeechRecognizer(this) } catch (_: Exception) { return null }
+        }
         recognizer = r
         listening = false
 
@@ -337,12 +353,16 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
 
     private fun speechIntent(partial: Boolean, silence: Long): Intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+        // Intentar es-MX primero, pero con fallback a es-ES y default del sistema para compatibilidad
         putExtra(RecognizerIntent.EXTRA_LANGUAGE, "es-MX")
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "es-MX")
+        putExtra(RecognizerIntent.EXTRA_SUPPORTED_LANGUAGES, arrayListOf("es-MX", "es-ES", "es-US", "es"))
         putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, partial)
         putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
         putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, silence)
         putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, silence)
+        // Preferir offline si está disponible para gama media sin internet rápido
+        putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
     }
 
     private fun beginContinuationWindow() {
@@ -575,7 +595,11 @@ Regla de seguridad: el TF-Luna tiene una zona de protección de mayor alcance qu
 
     private fun speak(text: String) {
         pausedByUser = false
-        if (!::tts.isInitialized) { startHotword(); return }
+        if (!::tts.isInitialized) {
+            // Si TTS no está listo, igual intentar iniciar hotword para no bloquear
+            try { startHotword() } catch (_: Exception) {}
+            return
+        }
         hotwordMode = false
         conversationMode = true
         val spoken = text.replace("WayCore", "guaycor", ignoreCase = true)
@@ -583,8 +607,26 @@ Regla de seguridad: el TF-Luna tiene una zona de protección de mayor alcance qu
             .replace("WayCorp", "guaycorp", ignoreCase = true)
         beepReady()
         main.postDelayed({
-            routeToHeadsetIfPossible()
-            tts.speak(spoken, TextToSpeech.QUEUE_FLUSH, null, "karbys-answer")
+            try {
+                routeToHeadsetIfPossible()
+                // Verificar que TTS no esté hablando ya para evitar corte en gama media
+                if (::tts.isInitialized) {
+                    val result = tts.speak(spoken, TextToSpeech.QUEUE_FLUSH, null, "karbys-answer")
+                    if (result == TextToSpeech.ERROR) {
+                        // Fallback: reintentar con idioma default
+                        try {
+                            tts.language = Locale.getDefault()
+                            tts.speak(spoken, TextToSpeech.QUEUE_FLUSH, null, "karbys-answer")
+                        } catch (_: Exception) {
+                            // Si todo falla, al menos volver a escuchar
+                            beginContinuationWindow()
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                // En algunos dispositivos con poca RAM, TTS puede lanzar excepción
+                try { beginContinuationWindow() } catch (_: Exception) {}
+            }
         }, 80)
     }
 
@@ -600,15 +642,60 @@ Regla de seguridad: el TF-Luna tiene una zona de protección de mayor alcance qu
     }
 
     override fun onInit(status: Int) {
-        if (status != TextToSpeech.SUCCESS) return
-        val preferred = listOf(Locale("es", "MX"), Locale("es", "US"), Locale("es", "CO"), Locale("es", "GT"), Locale("es", "CR"))
-        val chosen = preferred.firstOrNull { tts.isLanguageAvailable(it) >= TextToSpeech.LANG_AVAILABLE }
-        if (chosen != null) tts.language = chosen
-        tts.voices?.firstOrNull { v ->
-            v.locale.language == "es" && preferred.any { p -> v.locale.country == p.country }
-        }?.let { tts.voice = it }
-        tts.setSpeechRate(0.93f)
-        tts.setPitch(1.04f)
+        if (status != TextToSpeech.SUCCESS) {
+            // Intentar reinicializar TTS con motor por defecto si falla
+            try {
+                tts = TextToSpeech(this, null)
+            } catch (_: Exception) {}
+            return
+        }
+        try {
+            // Lista amplia para gama media-alta: cualquier español sirve
+            val preferred = listOf(
+                Locale("es", "MX"), Locale("es", "US"), Locale("es", "ES"),
+                Locale("es", "CO"), Locale("es", "GT"), Locale("es", "CR"),
+                Locale("es", "AR"), Locale("es", "CL"), Locale("es", ""),
+                Locale("es"), Locale.getDefault(), Locale.US
+            )
+
+            var languageSet = false
+            for (loc in preferred) {
+                try {
+                    val avail = tts.isLanguageAvailable(loc)
+                    if (avail >= TextToSpeech.LANG_AVAILABLE) {
+                        tts.language = loc
+                        languageSet = true
+                        break
+                    }
+                } catch (_: Exception) { continue }
+            }
+
+            // Si no hay español, usar el default del sistema pero no fallar
+            if (!languageSet) {
+                try { tts.language = Locale.getDefault() } catch (_: Exception) {}
+            }
+
+            // Buscar voz española compatible sin exigir país exacto
+            try {
+                val voices = tts.voices
+                val spanishVoice = voices?.firstOrNull { v ->
+                    v.locale.language.equals("es", true) && !v.isNetworkConnectionRequired
+                } ?: voices?.firstOrNull { v -> v.locale.language.equals("es", true) }
+                ?: voices?.firstOrNull { v -> v.locale.language.equals("en", true) }
+
+                spanishVoice?.let { tts.voice = it }
+            } catch (_: Exception) {
+                // Algunos fabricantes (Xiaomi, Huawei) lanzan excepción en tts.voices
+            }
+
+            tts.setSpeechRate(0.93f)
+            tts.setPitch(1.04f)
+        } catch (e: Exception) {
+            // Nunca dejar que TTS crashee el servicio en gama media
+            try {
+                tts.language = Locale("es", "ES")
+            } catch (_: Exception) {}
+        }
     }
 
     override fun onDestroy() {

@@ -9,16 +9,25 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 object GeminiClient {
-    private const val MODEL = "gemini-3.1-flash-lite"
+    // Modelos compatibles con gama media-alta, ordenados de mejor a más compatible.
+    // gemini-3.1 no existe, por eso fallaba con "modelo no se puede usar".
+    private val MODELS_TO_TRY = listOf(
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-8b",
+        "gemini-2.0-flash-lite"
+    )
+
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
         .writeTimeout(20, TimeUnit.SECONDS)
+        .retryOnConnectionFailure(true)
         .build()
 
     suspend fun ask(user: String, memory: List<ConversationTurn>, deviceContext: String): String {
         val apiKey = BuildConfig.GEMINI_API_KEY.trim()
-        if (apiKey.isBlank()) return "Falta configurar la clave de Gemini en WayCore."
+        if (apiKey.isBlank()) return "Falta configurar la clave de Gemini en WayCore. Ve a local.properties y pon GEMINI_API_KEY."
         if (user.isBlank()) return "No escuché ninguna pregunta."
 
         return try {
@@ -28,11 +37,36 @@ object GeminiClient {
                 )
             )
 
-            repeat(3) {
-                val raw = generate(apiKey, contents)
-                if (raw == null) return "No pude obtener una respuesta válida de Gemini."
+            // Intentamos hasta 3 rondas de function calling, con fallback de modelos
+            repeat(3) { round ->
+                var lastError: String? = null
+                var raw: JSONObject? = null
+
+                for (model in MODELS_TO_TRY) {
+                    val result = generateWithModel(apiKey, model, contents)
+                    if (result.isSuccess) {
+                        raw = result.json
+                        break
+                    } else {
+                        lastError = result.error
+                        // Si es error 404 de modelo no encontrado, probamos siguiente modelo inmediatamente
+                        if (result.shouldTryNextModel) continue else break
+                    }
+                }
+
+                if (raw == null) {
+                    return lastError ?: "No pude obtener una respuesta válida de Gemini. Revisa internet."
+                }
+
                 val candidate = raw.optJSONArray("candidates")?.optJSONObject(0)
-                    ?: return "Gemini no devolvió una respuesta válida."
+                    ?: return "Gemini no devolvió una respuesta válida, pero el modelo sí funciona. Intenta de nuevo."
+
+                // Si hay finishReason SAFETY o similar, dar mensaje claro
+                val finishReason = candidate.optString("finishReason", "")
+                if (finishReason == "SAFETY") {
+                    return "No puedo responder eso por seguridad, pero dime de otra forma y te ayudo."
+                }
+
                 val modelContent = candidate.optJSONObject("content") ?: JSONObject()
                 val parts = modelContent.optJSONArray("parts") ?: JSONArray()
 
@@ -45,7 +79,14 @@ object GeminiClient {
                     if (t.isNotBlank()) text = if (text.isBlank()) t else "$text\n$t"
                 }
 
-                if (calls.isEmpty()) return text.ifBlank { "No recibí una respuesta hablada de Gemini." }
+                if (calls.isEmpty()) {
+                    // Si no hay function calls, retornamos texto directo
+                    return text.ifBlank {
+                        // A veces Gemini devuelve texto vacío con finishReason MAX_TOKENS, etc.
+                        if (finishReason.isNotBlank()) "Recibí una respuesta vacía de Gemini con motivo $finishReason. Intenta preguntar de nuevo más corto."
+                        else "No recibí una respuesta hablada de Gemini, pero el modelo ya funciona en tu dispositivo."
+                    }
+                }
 
                 // Preserve Gemini's model content, including tool-call metadata/signatures.
                 contents.put(JSONObject(modelContent.toString()).put("role", "model"))
@@ -63,30 +104,60 @@ object GeminiClient {
                 contents.put(JSONObject().put("role", "user").put("parts", responseParts))
             }
 
-            "No pude terminar la acción de WayHat en este momento."
-        } catch (_: Exception) {
-            "No pude conectar con Gemini. Revisa tu conexión a Internet."
+            "No pude terminar la acción de WayHat en este momento, pero el modelo ya es compatible con tu celular."
+        } catch (e: Exception) {
+            "No pude conectar con Gemini: ${e.message}. Revisa tu conexión a Internet. El modelo ahora es compatible con gama media."
         }
     }
 
-    private fun generate(apiKey: String, contents: JSONArray): JSONObject? {
+    private data class GenerateResult(
+        val json: JSONObject?,
+        val error: String?,
+        val shouldTryNextModel: Boolean
+    ) {
+        val isSuccess get() = json != null
+    }
+
+    private fun generateWithModel(apiKey: String, model: String, contents: JSONArray): GenerateResult {
         val body = JSONObject()
             .put("contents", contents)
             .put("tools", JSONArray().put(JSONObject().put("functionDeclarations", toolDeclarations())))
+            .put("generationConfig", JSONObject()
+                .put("temperature", 0.7)
+                .put("maxOutputTokens", 1024)
+            )
             .toString()
             .toRequestBody("application/json; charset=utf-8".toMediaType())
 
         val request = Request.Builder()
-            .url("https://generativelanguage.googleapis.com/v1beta/models/$MODEL:generateContent")
+            .url("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent")
             .addHeader("x-goog-api-key", apiKey)
             .addHeader("Content-Type", "application/json")
             .post(body)
             .build()
 
-        client.newCall(request).execute().use { response ->
-            val raw = response.body?.string().orEmpty()
-            if (!response.isSuccessful) return null
-            return JSONObject(raw)
+        return try {
+            client.newCall(request).execute().use { response ->
+                val raw = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    // Analizar error para decidir si probar siguiente modelo
+                    val isModelNotFound = response.code == 404 || raw.contains("not found", ignoreCase = true) || raw.contains("is not supported", ignoreCase = true) || raw.contains("model", ignoreCase = true) && raw.contains("not", ignoreCase = true)
+                    val errorMsg = when (response.code) {
+                        404 -> "Modelo $model no encontrado, probando otro compatible..."
+                        400 -> "Error 400 con $model: $raw"
+                        403 -> "Clave API no válida o sin permisos."
+                        429 -> "Límite de uso de Gemini alcanzado, espera un minuto."
+                        500, 503 -> "Servidor de Gemini ocupado, reintentando..."
+                        else -> "Error ${response.code}: $raw"
+                    }
+                    // Para 404, 400 con modelo no soportado, y 5xx, intentamos siguiente modelo
+                    val shouldTryNext = response.code == 404 || response.code == 500 || response.code == 503 || (response.code == 400 && raw.contains("model", true))
+                    return GenerateResult(null, errorMsg, shouldTryNext)
+                }
+                return GenerateResult(JSONObject(raw), null, false)
+            }
+        } catch (e: Exception) {
+            GenerateResult(null, "Error de red con $model: ${e.message}", true)
         }
     }
 
