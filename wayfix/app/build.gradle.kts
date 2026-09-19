@@ -26,22 +26,57 @@ val geminiKey = geminiKeyRaw.trim()
     .replace("\r", "")
     .replace("\n", "")
 
+// Firma propia opcional. Si existe wayfix/keystore.properties, el build release usa esa
+// keystore; si no, se firma con la clave de depuración para que el APK sea instalable.
+val keystoreProps = Properties()
+val keystorePropsFile = rootProject.file("keystore.properties")
+val hasKeystore = keystorePropsFile.exists() && run {
+    keystorePropsFile.inputStream().use { keystoreProps.load(it) }
+    !keystoreProps.getProperty("storeFile").isNullOrBlank()
+}
+
 android {
     namespace = "com.wayhat.waycore"
     compileSdk = 35
 
     defaultConfig {
         applicationId = "com.wayhat.waycore"
-        // Gama media-alta compatible desde Android 8.0
         minSdk = 26
         targetSdk = 35
-        // IMPORTANTE: versionCode siempre mayor para que al tocar el APK se actualice solo
-        // sin desinstalar. Android detecta mismo package + firma + versionCode mayor = update.
-        versionCode = 7
-        versionName = "0.5.1"
+        // Bump para que al tocar APK se actualice solo (mismo package + firma + versionCode mayor)
+        versionCode = 9
+        versionName = "0.7.1"
         buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
-        // No se descarga ningún modelo local, todo es en la nube, por eso no pesa.
         buildConfigField("boolean", "AUTO_UPDATE_ENABLED", "true")
+
+        // El motor de IA local trae librerías nativas por arquitectura. Sin este filtro el
+        // APK arrastraría también la variante de emulador x86. Para probar en emulador,
+        // añadir "x86_64" a la lista o compilar con -PABI=x86_64.
+        ndk {
+            val wanted = providers.gradleProperty("ABI").orNull
+                ?: System.getenv("WAYCORE_ABI")
+                ?: "arm64-v8a,armeabi-v7a"
+            abiFilters += wanted.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+        }
+    }
+
+    buildTypes {
+        getByName("debug") {
+            versionNameSuffix = "-debug"
+        }
+        getByName("release") {
+            isMinifyEnabled = false
+            signingConfig = if (hasKeystore) {
+                signingConfigs.create("wayhat") {
+                    storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
+                    storePassword = keystoreProps.getProperty("storePassword")
+                    keyAlias = keystoreProps.getProperty("keyAlias")
+                    keyPassword = keystoreProps.getProperty("keyPassword")
+                }
+            } else {
+                signingConfigs.getByName("debug")
+            }
+        }
     }
 
     compileOptions {
@@ -51,6 +86,12 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+        // El AAR de LiteRT-LM se publica con un Kotlin más nuevo que el del proyecto. Sin esta
+        // bandera el compilador aborta leyendo metadatos ajenos (y ni siquiera llega a revisar
+        // si nuestro código está bien); con ella se ignora la diferencia de versión y el resto
+        // de la API se usa normal. Si alguna vez falla, la alternativa es subir
+        // org.jetbrains.kotlin.android / plugin.compose a la versión con la que viene built.
+        freeCompilerArgs += "-Xskip-metadata-version-check"
     }
 
     buildFeatures {
@@ -58,26 +99,22 @@ android {
         buildConfig = true
     }
 
-    buildTypes {
-        release {
-            isMinifyEnabled = false
-            isShrinkResources = false
-            // Importante para que la actualización con un toque funcione:
-            // No cambiamos applicationId ni usamos splits que rompan la firma
-        }
-        debug {
-            isMinifyEnabled = false
-        }
+    lint {
+        // Los avisos de lint no deben impedir un build del sombrero; se revisan aparte.
+        abortOnError = false
+        checkReleaseBuilds = false
     }
 
     packaging {
-        resources {
-            excludes += "/META-INF/{AL2.0,LGPL2.1}"
-        }
+        resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        // litert y litertlm empaquetan el mismo .so de OpenCL; sin esto la Fusión de
+        // librerías nativas falla con "2 files found with path".
+        jniLibs.pickFirsts += "**/libLiteRtClGlAccelerator.so"
     }
 
-    // Asegura que el APK sea instalable como actualización
-    // Mismo package, misma firma debug/release, versionCode incrementado
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -88,8 +125,17 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
-    implementation("androidx.work:work-runtime-ktx:2.10.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("org.json:json:20240303")
+
+    // Motor de inferencia local (llama.cpp por dentro) para el GGUF de Qwen.
+        // Versión fijada en vez de latest.release: 0.17.1 es la que se probó contra esta app.
+    // Si se sube, hay que volver a pasar las pruebas del motor (el AAR cambia su API).
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.17.1")
+
+    testImplementation("junit:junit:4.13.2")
+    // En las pruebas de JVM org.json no viene del framework de Android.
+    testImplementation("org.json:json:20240303")
+    // org.json no se agrega como librería: el framework de Android ya la provee.
+    // androidx.work tampoco: WayCore usa AlarmManager, no WorkManager.
 }

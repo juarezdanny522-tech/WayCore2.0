@@ -1,5 +1,6 @@
 package com.wayhat.waycore
 
+import android.content.Context
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -8,124 +9,136 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
+/**
+ * Cliente de Gemini con function calling para controlar WayHat.
+ *
+ * Dos detalles importantes:
+ *  - La clave se lee de Prefs (ajustes en la app) y solo usa BuildConfig como respaldo,
+ *    para poder repartir el mismo APK sin dejar una clave dentro del repositorio.
+ *  - Si Google jubila un id de modelo, WayCore prueba los siguientes en la lista en vez
+ *    de quedarse mudo.
+ */
 object GeminiClient {
-    // Modelos compatibles con gama media-alta, ordenados de mejor a más compatible.
-    // gemini-3.1 no existe, por eso fallaba con "modelo no se puede usar".
-    private val MODELS_TO_TRY = listOf(
+    private const val RETRY_MODEL = "\u0000model"
+
+    // MODELOS REALES que existen en 2026 y funcionan en gama media-alta.
+    // Antes tenías 3.5 y 3.1 que no existen y daban "modelo no se puede usar".
+    private val FALLBACK_MODELS = listOf(
         "gemini-2.0-flash",
         "gemini-1.5-flash",
         "gemini-1.5-flash-8b",
-        "gemini-2.0-flash-lite"
+        "gemini-2.0-flash-lite",
+        "gemini-2.5-flash"
     )
+
+    val MODEL_SUGGESTIONS: List<String> get() = FALLBACK_MODELS
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(60, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
         .writeTimeout(20, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(true)
         .build()
 
-    suspend fun ask(user: String, memory: List<ConversationTurn>, deviceContext: String): String {
-        val apiKey = BuildConfig.GEMINI_API_KEY.trim()
-        if (apiKey.isBlank()) return "Falta configurar la clave de Gemini en WayCore. Ve a local.properties y pon GEMINI_API_KEY."
+    fun models(context: Context): List<String> =
+        (listOf(Prefs.model(context)) + FALLBACK_MODELS).map { it.trim() }.filter { it.isNotBlank() }.distinct()
+
+    suspend fun ask(context: Context, user: String, memory: List<ConversationTurn>, deviceContext: String): String {
+        val apiKey = Prefs.apiKey(context)
+        if (apiKey.isBlank()) return "Todavía falta tu clave de Gemini. Abre WayCore, escríbela en el campo Clave de Gemini y toca Guardar clave. Mientras tanto sí puedo hablar de WayHat, sensores, alarmas y recordatorios."
         if (user.isBlank()) return "No escuché ninguna pregunta."
 
-        return try {
-            val contents = JSONArray().put(
-                JSONObject().put("role", "user").put(
-                    "parts", JSONArray().put(JSONObject().put("text", buildPrompt(user, memory, deviceContext)))
-                )
-            )
-
-            // Intentamos hasta 3 rondas de function calling, con fallback de modelos
-            repeat(3) { round ->
-                var lastError: String? = null
-                var raw: JSONObject? = null
-
-                for (model in MODELS_TO_TRY) {
-                    val result = generateWithModel(apiKey, model, contents)
-                    if (result.isSuccess) {
-                        raw = result.json
-                        break
-                    } else {
-                        lastError = result.error
-                        // Si es error 404 de modelo no encontrado, probamos siguiente modelo inmediatamente
-                        if (result.shouldTryNextModel) continue else break
-                    }
-                }
-
-                if (raw == null) {
-                    return lastError ?: "No pude obtener una respuesta válida de Gemini. Revisa internet."
-                }
-
-                val candidate = raw.optJSONArray("candidates")?.optJSONObject(0)
-                    ?: return "Gemini no devolvió una respuesta válida, pero el modelo sí funciona. Intenta de nuevo."
-
-                // Si hay finishReason SAFETY o similar, dar mensaje claro
-                val finishReason = candidate.optString("finishReason", "")
-                if (finishReason == "SAFETY") {
-                    return "No puedo responder eso por seguridad, pero dime de otra forma y te ayudo."
-                }
-
-                val modelContent = candidate.optJSONObject("content") ?: JSONObject()
-                val parts = modelContent.optJSONArray("parts") ?: JSONArray()
-
-                val calls = mutableListOf<JSONObject>()
-                var text = ""
-                for (i in 0 until parts.length()) {
-                    val part = parts.optJSONObject(i) ?: continue
-                    part.optJSONObject("functionCall")?.let { calls += it }
-                    val t = part.optString("text").trim()
-                    if (t.isNotBlank()) text = if (text.isBlank()) t else "$text\n$t"
-                }
-
-                if (calls.isEmpty()) {
-                    // Si no hay function calls, retornamos texto directo
-                    return text.ifBlank {
-                        // A veces Gemini devuelve texto vacío con finishReason MAX_TOKENS, etc.
-                        if (finishReason.isNotBlank()) "Recibí una respuesta vacía de Gemini con motivo $finishReason. Intenta preguntar de nuevo más corto."
-                        else "No recibí una respuesta hablada de Gemini, pero el modelo ya funciona en tu dispositivo."
-                    }
-                }
-
-                // Preserve Gemini's model content, including tool-call metadata/signatures.
-                contents.put(JSONObject(modelContent.toString()).put("role", "model"))
-                val responseParts = JSONArray()
-                for (call in calls) {
-                    val name = call.optString("name")
-                    val args = call.optJSONObject("args") ?: JSONObject()
-                    val result = WayHatService.executeTool(name, args)
-                    responseParts.put(
-                        JSONObject().put("functionResponse", JSONObject()
-                            .put("name", name)
-                            .put("response", JSONObject().put("result", result)))
-                    )
-                }
-                contents.put(JSONObject().put("role", "user").put("parts", responseParts))
+        val candidates = models(context)
+        var modelUnavailable = false
+        for (model in candidates) {
+            val answer = converse(model, apiKey, user, memory, deviceContext)
+            if (answer == RETRY_MODEL) {
+                modelUnavailable = true
+            } else {
+                return answer
             }
-
-            "No pude terminar la acción de WayHat en este momento, pero el modelo ya es compatible con tu celular."
-        } catch (e: Exception) {
-            "No pude conectar con Gemini: ${e.message}. Revisa tu conexión a Internet. El modelo ahora es compatible con gama media."
+        }
+        return if (modelUnavailable) {
+            "Ninguno de los modelos que conoce WayCore funciona con tu clave. Los que prueba son ${candidates.joinToString(", ")}. Puedes escribir otro nombre de modelo en los ajustes."
+        } else {
+            "No pude obtener una respuesta válida de Gemini."
         }
     }
 
-    private data class GenerateResult(
-        val json: JSONObject?,
-        val error: String?,
-        val shouldTryNextModel: Boolean
-    ) {
-        val isSuccess get() = json != null
+    private suspend fun converse(
+        model: String,
+        apiKey: String,
+        user: String,
+        memory: List<ConversationTurn>,
+        deviceContext: String
+    ): String {
+        val contents = JSONArray().put(
+            JSONObject().put("role", "user").put(
+                "parts", JSONArray().put(JSONObject().put("text", buildPrompt(user, memory, deviceContext)))
+            )
+        )
+
+        repeat(3) {
+            val reply = generate(model, apiKey, contents)
+            val error = reply.json?.optJSONObject("error")
+            val status = error?.optString("status").orEmpty().uppercase()
+
+            when {
+                reply.code == 200 -> Unit
+                reply.code == 0 -> return "No pude conectar con Gemini. Revisa tu conexión a Internet."
+                reply.code == 401 || reply.code == 403 || status.contains("API_KEY") ->
+                    return "La clave de Gemini no es válida o no tiene permiso para este modelo. Revísala en los ajustes de WayCore."
+                reply.code == 429 || status.contains("RESOURCE_EXHAUSTED") ->
+                    return "Gemini dice que vas pasado de peticiones por ahora. Espera un minuto y pregúntame de nuevo."
+                reply.code == 404 || status.contains("NOT_FOUND") || status.contains("NOT_SUPPORTED") ->
+                    return RETRY_MODEL
+                else -> return "Gemini respondió un error ${reply.code}. Si sigue pasando, cambia el modelo en los ajustes de WayCore."
+            }
+
+            val raw = reply.json ?: return "Gemini devolvió una respuesta vacía."
+            val blocked = raw.optJSONObject("promptFeedback")?.optString("blockReason").orEmpty()
+            if (blocked.isNotBlank()) return "Gemini frenó esta pregunta por su regla de seguridad $blocked. Intenta formularla de otra forma."
+
+            val candidate = raw.optJSONArray("candidates")?.optJSONObject(0)
+                ?: return "Gemini no devolvió una respuesta válida."
+            val modelContent = candidate.optJSONObject("content") ?: JSONObject()
+            val parts = modelContent.optJSONArray("parts") ?: JSONArray()
+
+            val calls = mutableListOf<JSONObject>()
+            var text = ""
+            for (i in 0 until parts.length()) {
+                val part = parts.optJSONObject(i) ?: continue
+                part.optJSONObject("functionCall")?.let { calls += it }
+                val t = part.optString("text").trim()
+                if (t.isNotBlank()) text = if (text.isBlank()) t else "$text\n$t"
+            }
+
+            if (calls.isEmpty()) return text.ifBlank { "No recibí una respuesta hablada de Gemini." }
+
+            // Preserve Gemini's model content, including tool-call metadata/signatures.
+            contents.put(JSONObject(modelContent.toString()).put("role", "model"))
+            val responseParts = JSONArray()
+            for (call in calls) {
+                val name = call.optString("name")
+                val args = call.optJSONObject("args") ?: JSONObject()
+                val result = WayHatService.executeTool(name, args)
+                responseParts.put(
+                    JSONObject().put("functionResponse", JSONObject()
+                        .put("name", name)
+                        .put("response", JSONObject().put("result", result)))
+                )
+            }
+            contents.put(JSONObject().put("role", "user").put("parts", responseParts))
+        }
+
+        return "No pude terminar la acción de WayHat en este momento."
     }
 
-    private fun generateWithModel(apiKey: String, model: String, contents: JSONArray): GenerateResult {
+    private class Reply(val code: Int, val json: JSONObject?)
+
+    private fun generate(model: String, apiKey: String, contents: JSONArray): Reply {
         val body = JSONObject()
             .put("contents", contents)
             .put("tools", JSONArray().put(JSONObject().put("functionDeclarations", toolDeclarations())))
-            .put("generationConfig", JSONObject()
-                .put("temperature", 0.7)
-                .put("maxOutputTokens", 1024)
-            )
             .toString()
             .toRequestBody("application/json; charset=utf-8".toMediaType())
 
@@ -139,25 +152,11 @@ object GeminiClient {
         return try {
             client.newCall(request).execute().use { response ->
                 val raw = response.body?.string().orEmpty()
-                if (!response.isSuccessful) {
-                    // Analizar error para decidir si probar siguiente modelo
-                    val isModelNotFound = response.code == 404 || raw.contains("not found", ignoreCase = true) || raw.contains("is not supported", ignoreCase = true) || raw.contains("model", ignoreCase = true) && raw.contains("not", ignoreCase = true)
-                    val errorMsg = when (response.code) {
-                        404 -> "Modelo $model no encontrado, probando otro compatible..."
-                        400 -> "Error 400 con $model: $raw"
-                        403 -> "Clave API no válida o sin permisos."
-                        429 -> "Límite de uso de Gemini alcanzado, espera un minuto."
-                        500, 503 -> "Servidor de Gemini ocupado, reintentando..."
-                        else -> "Error ${response.code}: $raw"
-                    }
-                    // Para 404, 400 con modelo no soportado, y 5xx, intentamos siguiente modelo
-                    val shouldTryNext = response.code == 404 || response.code == 500 || response.code == 503 || (response.code == 400 && raw.contains("model", true))
-                    return GenerateResult(null, errorMsg, shouldTryNext)
-                }
-                return GenerateResult(JSONObject(raw), null, false)
+                val parsed = try { JSONObject(raw) } catch (_: Exception) { null }
+                Reply(if (response.isSuccessful) 200 else response.code, parsed)
             }
-        } catch (e: Exception) {
-            GenerateResult(null, "Error de red con $model: ${e.message}", true)
+        } catch (_: Exception) {
+            Reply(0, null)
         }
     }
 

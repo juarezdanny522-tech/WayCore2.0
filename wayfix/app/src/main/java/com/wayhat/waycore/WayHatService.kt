@@ -36,6 +36,8 @@ class WayHatService : Service() {
         const val ACTION_STOP = "com.wayhat.waycore.WAYHAT_STOP"
         const val ACTION_COMMAND = "com.wayhat.waycore.WAYHAT_COMMAND"
         const val ACTION_STATUS = "com.wayhat.waycore.WAYHAT_STATUS"
+        /** Peligro detectado: Karbys interrumpe lo que esté diciendo para avisar. */
+        const val ACTION_ALERT = "com.wayhat.waycore.PROXIMITY_ALERT"
         const val EXTRA_COMMAND = "command"
         const val EXTRA_JSON = "json"
         const val DEVICE_NAME = "WayHat-Karbys"
@@ -64,6 +66,7 @@ class WayHatService : Service() {
     private val pendingAcks = ConcurrentHashMap<String, CompletableDeferred<String>>()
     private lateinit var vibrator: Vibrator
     private var lastVibrationAt = 0L
+    private var lastVoiceAlertAt = 0L
 
     override fun onCreate() {
         super.onCreate()
@@ -221,19 +224,28 @@ class WayHatService : Service() {
         ).filterNotNull().minOrNull() ?: return
 
         val now = System.currentTimeMillis()
-        if (now - lastVibrationAt < 350L) return
+        val maxDistance = maxOf(threshold, tfSafetyDistance).coerceAtLeast(1)
+
+        // gap = pausa entre pulsos: mientras más cerca el obstáculo, más rápido vibra.
+        // Antes este valor se calculaba y nunca se usaba, así que el teléfono vibraba
+        // igual a 20 cm que a 1 metro.
+        val gap = ((dangerDistance.toLong() * 320L) / maxDistance.toLong()).coerceIn(35L, 260L)
+        if (now - lastVibrationAt < gap + 90L) return
         lastVibrationAt = now
 
-        val maxDistance = maxOf(threshold, tfSafetyDistance)
-        val gap = ((dangerDistance.toLong() * 320L) / maxDistance.toLong()).coerceIn(35L, 260L)
+        val pattern = if (dangerDistance * 2 <= maxDistance) longArrayOf(0, 130, 55, 130) else longArrayOf(0, 95)
         try {
-            if (Build.VERSION.SDK_INT >= 26) {
-                vibrator.vibrate(VibrationEffect.createOneShot(90L, 180))
-            } else {
-                @Suppress("DEPRECATION")
-                vibrator.vibrate(90L)
-            }
+            vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
         } catch (_: Exception) { }
+
+        // Aviso hablado como refuerzo del buzzer, con su propio ritmo más lento para no
+        // cortar la conversación cada medio metro.
+        if (now - lastVoiceAlertAt >= 4000L) {
+            lastVoiceAlertAt = now
+            try {
+                sendBroadcast(Intent(ACTION_ALERT).setPackage(packageName).putExtra("distance", dangerDistance))
+            } catch (_: Exception) { }
+        }
     }
 
     private fun sendJson(json: String) {
@@ -279,7 +291,10 @@ class WayHatService : Service() {
         pendingAcks[commandId] = waiter
         sendJson(json.toString())
         return try {
-            withTimeout(1800L) { waiter.await() }
+            withTimeout(3000L) { waiter.await() }
+        } catch (_: TimeoutCancellationException) {
+            pendingAcks.remove(commandId)
+            "Le mandé la orden a WayHat pero el sombrero no confirmó a tiempo. Revisa que esté encendido y conectado por Bluetooth."
         } catch (_: CancellationException) {
             pendingAcks.remove(commandId)
             "No pude confirmar el comando porque se perdió la conexión con WayHat."

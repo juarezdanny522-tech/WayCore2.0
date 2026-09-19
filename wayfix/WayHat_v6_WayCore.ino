@@ -2,9 +2,21 @@
 #include <DHT.h>
 #include "BluetoothSerial.h"
 
-// WAYHAT -> WAYCORE
+// WAYHAT -> WAYCORE  (v6.1)
 // ESP32-WROOM-32 / Bluetooth Classic SPP
-// Sensors: 3x HC-SR04, TF-Luna, DHT11, buzzer
+// Sensores: 3x HC-SR04, TF-Luna, DHT11, buzzer
+//
+// Cambios frente a v6:
+//  - El DHT11 solo se lee una vez por segundo. Es un sensor de 1 Hz: pedirle datos
+//    cada 250 ms producía checksum malo y "dht_ok":false casi siempre.
+//  - Los HC-SR04 se leen separados 6 ms para que el pulido de uno no entre por
+//    reflexión al receptor del vecino (eco cruzado = distancia falsa corta).
+//  - El TF-Luna comparte con WayCore la regla de zona de seguridad más amplia.
+//  - El frame del TF-Luna se descarta si se queda a medias (resincroniza solo).
+//
+// OJO con las unidades: el TF-Luna sale de fábrica en formato 9-byte / CENTIMETROS
+// (ID_OUTPUT_FORMAT=0x01). Si alguien lo configura en 9-byte/mm (0x06), hay que
+// dividir entre 10 aqui abajo o el sombrero creera que todo esta a 10x de distancia.
 
 #define DR_TRIG 25
 #define DR_ECHO 13
@@ -19,6 +31,9 @@
 
 #define DHT_TYPE DHT11
 #define BT_NAME "WayHat-Karbys"
+#define TF_UNIT_CM true      // false => el modulo esta en 9-byte/mm
+#define DHT_INTERVAL_MS 1000 // minimo real del DHT11
+#define HC_GAP_MS 6          // separacion entre lecturas de HC-SR04
 
 BluetoothSerial BT;
 HardwareSerial TF(2);
@@ -36,7 +51,7 @@ struct State {
 bool lastBtClient = false;
 
 String rx;
-uint32_t nextSensors = 0, nextTelemetry = 0, nextBeep = 0;
+uint32_t nextSensors = 0, nextTelemetry = 0, nextBeep = 0, nextDht = 0;
 bool beepOn = false;
 
 long hc(int trig, int echo) {
@@ -47,16 +62,27 @@ long hc(int trig, int echo) {
   return t ? (long)(t * 0.0343f * 0.5f) : -1;
 }
 
+// Formato por defecto del TF-Luna (9 bytes):
+// 0:0x59 1:0x59 2:Dist_L 3:Dist_H 4:Amp_L 5:Amp_H 6:Temp_L 7:Temp_H 8:Checksum
 void readTF() {
   static uint8_t b[9], n = 0;
+  static uint32_t lastByte = 0;
+
+  // Si pasaron mas de 80 ms sin datos, el buffer quedo a medias: reiniciar.
+  if (n > 0 && millis() - lastByte > 80) n = 0;
+
   while (TF.available()) {
     uint8_t x = TF.read();
+    lastByte = millis();
     if (n == 0 && x != 0x59) continue;
     if (n == 1 && x != 0x59) { n = 0; continue; }
     b[n++] = x;
     if (n == 9) {
-      uint8_t sum = 0; for (int i=0;i<8;i++) sum += b[i];
-      if (sum == b[8]) st.tf = b[2] | (b[3] << 8);
+      uint8_t sum = 0; for (int i = 0; i < 8; i++) sum += b[i];
+      if (sum == b[8]) {
+        int mm = b[2] | (b[3] << 8);
+        st.tf = TF_UNIT_CM ? mm : (mm / 10);
+      }
       n = 0;
     }
   }
@@ -73,22 +99,45 @@ int minValid(int a, int b, int c, int d) {
 
 void readSensors() {
   st.right = hc(DR_TRIG, DR_ECHO);
+  delay(HC_GAP_MS);
   st.left  = hc(IZ_TRIG, IZ_ECHO);
+  delay(HC_GAP_MS);
   st.rear  = hc(AT_TRIG, AT_ECHO);
   readTF();
-  float t = dht.readTemperature(), h = dht.readHumidity();
-  st.dhtOk = !isnan(t) && !isnan(h);
-  if (!isnan(t)) st.temp = t;
-  if (!isnan(h)) st.hum = h;
+
+  uint32_t now = millis();
+  if ((int32_t)(now - nextDht) >= 0) {
+    nextDht = now + DHT_INTERVAL_MS;
+    float t = dht.readTemperature(), h = dht.readHumidity();
+    bool ok = !isnan(t) && !isnan(h);
+    st.dhtOk = ok;
+    if (ok) { st.temp = t; st.hum = h; }
+  }
+
   st.closest = minValid(st.right, st.left, st.rear, st.tf);
 }
 
+// Igual que WayCore en el telefono: el TF-Luna protege una zona mas amplia.
+int tfLimit() { return st.threshold > 100 ? st.threshold : 100; }
+
+// Distancia del obstaculo que debe sonar, o -1 si no hay ninguno en zona de riesgo.
+int nearestDanger() {
+  int m = 9999;
+  if (st.right > 0 && st.right <= st.threshold && st.right < m) m = st.right;
+  if (st.left  > 0 && st.left  <= st.threshold && st.left  < m) m = st.left;
+  if (st.rear  > 0 && st.rear  <= st.threshold && st.rear  < m) m = st.rear;
+  if (st.tf    > 0 && st.tf    <= tfLimit()    && st.tf    < m) m = st.tf;
+  return m == 9999 ? -1 : m;
+}
+
 void updateBuzzer() {
-  if (!st.safe || !st.buzzer || st.closest <= 0 || st.closest > st.threshold) {
+  int d = nearestDanger();
+  if (!st.safe || !st.buzzer || d <= 0) {
     noTone(BUZZER); beepOn = false; return;
   }
-  int d = constrain(st.closest, 5, st.threshold);
-  uint32_t gap = map(d, 5, st.threshold, 35, 650);
+  int lim = max(st.threshold, tfLimit());
+  int near = constrain(d, 5, lim);
+  uint32_t gap = map(near, 5, lim, 35, 650); // mas cerca => pitidos mas juntos
   uint32_t now = millis();
   if (now >= nextBeep) {
     if (!beepOn) { tone(BUZZER, 2100); beepOn = true; nextBeep = now + 45; }
@@ -145,9 +194,12 @@ void command(const String &s) {
     ok = false; message = "Tipo no permitido";
   }
 
+  // La telemetria es la fuente de verdad: despues de config/lectura se responde
+  // con el estado real para que WayCore confirme con datos, no con suposiciones.
   if (BT.hasClient()) {
-    BT.printf("{\"type\":\"ack\",\"id\":\"%s\",\"ok\":%s,\"message\":\"%s\"}\n",
-      id.c_str(), ok ? "true" : "false", message.c_str());
+    BT.printf("{\"type\":\"ack\",\"id\":\"%s\",\"ok\":%s,\"message\":\"%s\",\"threshold\":%d,\"mode\":\"%s\",\"buzzer\":%s}\n",
+      id.c_str(), ok ? "true" : "false", message.c_str(), st.threshold,
+      st.safe ? "SAFE" : "CHAT", st.buzzer ? "true" : "false");
   }
 }
 

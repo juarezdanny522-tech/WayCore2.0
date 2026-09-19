@@ -15,16 +15,15 @@ import java.io.FileOutputStream
 import java.util.concurrent.TimeUnit
 
 /**
- * Gestor de auto-actualización para WayCore.
+ * Gestor de auto-actualización para WayCore con cerebro local.
  * - Comprueba la última versión en GitHub Releases
  * - Descarga el APK
- * - Lo instala con un solo toque (sin desinstalar nada)
+ * - Lo instala con un solo toque (sin desinstalar)
  * 
  * Para que "presionar el APK actualice" funcione, Android solo necesita:
  * 1. Mismo applicationId (com.wayhat.waycore)
  * 2. Misma firma (debug/release)
  * 3. versionCode mayor
- * Todo eso ya está garantizado en build.gradle.kts
  */
 object UpdateManager {
 
@@ -59,7 +58,6 @@ object UpdateManager {
                 .build()
             client.newCall(request).execute().use { resp ->
                 if (!resp.isSuccessful) {
-                    // Si falla la API (rate limit), igual ofrecemos ir a releases
                     return@withContext UpdateInfo(
                         available = false,
                         latestVersion = currentName,
@@ -84,11 +82,9 @@ object UpdateManager {
                         }
                     }
                 }
-                // Si no hay apk en assets, usa la página de releases
                 if (apkUrl.isNullOrBlank()) apkUrl = GITHUB_FALLBACK_URL
 
                 val changelog = json.optString("body", null)
-
                 val latestCode = parseVersionCode(tag)
                 val isNewer = if (latestCode > 0 && currentCode > 0) latestCode > currentCode
                 else tag != currentName && tag.isNotBlank()
@@ -114,7 +110,6 @@ object UpdateManager {
     }
 
     private fun parseVersionCode(version: String): Long {
-        // Convierte "0.5.1" a 501, "0.6.0" a 600, etc para comparar
         return try {
             val parts = version.split(".")
             val major = parts.getOrNull(0)?.toLongOrNull() ?: 0
@@ -126,7 +121,6 @@ object UpdateManager {
 
     suspend fun downloadAndInstall(context: Context, url: String, onProgress: (Int) -> Unit = {}): String = withContext(Dispatchers.IO) {
         try {
-            // Si es la página de releases y no un apk directo, abrir navegador
             if (!url.endsWith(".apk", true)) {
                 withContext(Dispatchers.Main) {
                     val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
@@ -160,7 +154,7 @@ object UpdateManager {
                 }
 
                 withContext(Dispatchers.Main) { installApk(context, file) }
-                return@withContext "Descargado. Instalando..."
+                return@withContext "Descargado. Instalando... Toca Actualizar, no desinstales."
             }
         } catch (e: Exception) {
             return@withContext "Error descargando: ${e.message}"
@@ -177,29 +171,13 @@ object UpdateManager {
             }
             context.startActivity(intent)
         } catch (e: Exception) {
-            // Fallback: intentar con file:// si falla FileProvider (Android viejos)
             try {
                 val intent = Intent(Intent.ACTION_VIEW).apply {
                     setDataAndType(Uri.fromFile(file), "application/vnd.android.package-archive")
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                 }
                 context.startActivity(intent)
-            } catch (_: Exception) {
-                // Último fallback: abrir gestor de archivos
-            }
+            } catch (_: Exception) {}
         }
-    }
-
-    fun openApkFromDownloads(context: Context) {
-        // Este método es para el caso que el usuario ya descargó el apk manualmente.
-        // Al tocar el apk en el gestor de archivos, Android lo actualiza automáticamente
-        // si el versionCode es mayor y la firma coincide. No hay que desinstalar.
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            type = "application/vnd.android.package-archive"
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        }
-        try {
-            context.startActivity(intent)
-        } catch (_: Exception) {}
     }
 }

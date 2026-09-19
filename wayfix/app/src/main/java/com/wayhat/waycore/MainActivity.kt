@@ -6,7 +6,6 @@ import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.os.*
 import android.speech.SpeechRecognizer
-import android.speech.tts.TextToSpeech
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -22,12 +21,16 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import org.json.JSONObject
-import java.util.Locale
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
+    private val uiScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var ready by mutableStateOf(false)
     private var paused by mutableStateOf(false)
     private var wayHatConnected by mutableStateOf(false)
@@ -37,17 +40,33 @@ class MainActivity : ComponentActivity() {
     private var rear by mutableStateOf(-1)
     private var tf by mutableStateOf(-1)
     private var closest by mutableStateOf(-1)
+    private var temp by mutableStateOf("sin lectura")
+    private var hum by mutableStateOf("sin lectura")
     private var threshold by mutableStateOf(50)
     private var mode by mutableStateOf("SAFE")
     private var buzzer by mutableStateOf(true)
     private var battery by mutableStateOf(0)
     private var locationText by mutableStateOf("Ubicación no disponible")
+    private var lastKarbys by mutableStateOf("Karbys todavía no ha dicho nada.")
+    private var voiceAvailable by mutableStateOf(true)
+    private var keyConfigured by mutableStateOf(false)
+    private var keyDraft by mutableStateOf("")
+    private var modelDraft by mutableStateOf("")
+    private var brainMode by mutableStateOf(Prefs.BRAIN_AUTO)
+    private var modelReady by mutableStateOf(false)
+    private var modelLabel by mutableStateOf("")
+    private var quantLabel by mutableStateOf("")
+    private var modelPercent by mutableStateOf(0f)
+    private var downloading by mutableStateOf(false)
+    private var gpuPref by mutableStateOf(false)
+    private var voiceAlertPref by mutableStateOf(true)
+    private var deviceNote by mutableStateOf("")
     private var deviceCheck by mutableStateOf("Verificando compatibilidad…")
     private var updateStatus by mutableStateOf("")
     private var updateAvailable by mutableStateOf(false)
     private var latestVersion by mutableStateOf("")
-    private var downloadProgress by mutableStateOf(0)
-    private var isDownloading by mutableStateOf(false)
+    private var apkDownloadProgress by mutableStateOf(0)
+    private var isApkDownloading by mutableStateOf(false)
 
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { result ->
         val mic = result[Manifest.permission.RECORD_AUDIO] == true || has(Manifest.permission.RECORD_AUDIO)
@@ -58,49 +77,75 @@ class MainActivity : ComponentActivity() {
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action != WayHatService.ACTION_STATUS) return
-            intent.getStringExtra("message")?.let { wayHatMessage = it }
-            if (intent.hasExtra("connected")) wayHatConnected = intent.getBooleanExtra("connected", false)
-            intent.getStringExtra("telemetry")?.let { parseTelemetry(it) }
+            when (intent?.action) {
+                WayHatService.ACTION_STATUS -> {
+                    intent.getStringExtra("message")?.let { wayHatMessage = it }
+                    if (intent.hasExtra("connected")) wayHatConnected = intent.getBooleanExtra("connected", false)
+                    intent.getStringExtra("telemetry")?.let { parseTelemetry(it) }
+                }
+                KarbysService.ACTION_UI -> intent.getStringExtra("message")?.let { lastKarbys = it }
+                ModelManager.ACTION_PROGRESS -> {
+                    val phase = intent.getStringExtra(ModelManager.EXTRA_PHASE).orEmpty()
+                    modelLabel = intent.getStringExtra(ModelManager.EXTRA_TEXT).orEmpty()
+                    modelPercent = intent.getIntExtra(ModelManager.EXTRA_PERCENT, 0) / 100f
+                    downloading = phase != "listo" && phase != "error"
+                    if (phase == "listo" || phase == "error") refreshModelStatus()
+                }
+            }
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val filter = IntentFilter(WayHatService.ACTION_STATUS)
+        val filter = IntentFilter(WayHatService.ACTION_STATUS).apply {
+            addAction(KarbysService.ACTION_UI)
+            addAction(ModelManager.ACTION_PROGRESS)
+        }
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
         else registerReceiver(receiver, filter)
 
-        // Verificación de compatibilidad inmediata para gama media-alta
         checkDeviceCompatibility()
+        voiceAvailable = SpeechRecognizer.isRecognitionAvailable(this)
+        keyConfigured = Prefs.hasApiKey(this)
+        keyDraft = ""
+        modelDraft = Prefs.model(this)
+        refreshModelStatus()
+
+        // Auto-sugerir mejor modelo para gama media-alta si aún no tiene uno
+        if (Prefs.modelName(this).isBlank()) {
+            val best = ModelManager.bestModelForThisPhone(this)
+            Prefs.selectQuantization(this, best.fileName, best.url)
+            refreshModelStatus()
+        }
 
         setContent {
+            var prompt by remember { mutableStateOf("") }
+            val scope = rememberCoroutineScope()
+            val context = LocalContext.current
             MaterialTheme {
                 Surface(Modifier.fillMaxSize()) {
-                    var prompt by remember { mutableStateOf("") }
-                    val scope = rememberCoroutineScope()
-                    val context = LocalContext.current
-
                     Column(
-                        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp),
+                        Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Text("WAYCORE", style = MaterialTheme.typography.headlineMedium)
+                        Text("Versión ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) - Auto-actualizable", style = MaterialTheme.typography.labelSmall)
                         Text(if (wayHatConnected) "WayHat conectado" else wayHatMessage)
-                        Spacer(Modifier.height(6.dp))
                         Text(deviceCheck, style = MaterialTheme.typography.bodySmall)
-                        Text("v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) - Auto-actualizable", style = MaterialTheme.typography.labelSmall)
-
+                        if (!voiceAvailable) {
+                            Text("Este teléfono no tiene servicio de reconocimiento de voz: Karbys solo responderá por texto.", style = MaterialTheme.typography.bodySmall)
+                        }
                         Spacer(Modifier.height(10.dp))
 
-                        // --- Sección de actualización automática ---
+                        // --- Sección de actualización automática APK ---
                         Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
                             Column(Modifier.padding(12.dp)) {
-                                Text("Actualizaciones", style = MaterialTheme.typography.titleMedium)
+                                Text("Actualizaciones APK", style = MaterialTheme.typography.titleMedium)
+                                Text("Al tocar el APK nuevo se actualiza solo, sin desinstalar. No se descarga modelo dentro del APK.", style = MaterialTheme.typography.labelSmall)
                                 if (updateStatus.isNotBlank()) Text(updateStatus, style = MaterialTheme.typography.bodySmall)
-                                if (isDownloading) {
-                                    LinearProgressIndicator(progress = { downloadProgress / 100f }, modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp))
-                                    Text("$downloadProgress% descargado")
+                                if (isApkDownloading) {
+                                    LinearProgressIndicator(progress = { apkDownloadProgress / 100f }, modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp))
+                                    Text("$apkDownloadProgress% descargado")
                                 }
                                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 6.dp)) {
                                     Button(onClick = {
@@ -110,37 +155,30 @@ class MainActivity : ComponentActivity() {
                                             latestVersion = info.latestVersion
                                             if (info.available && info.downloadUrl != null) {
                                                 updateAvailable = true
-                                                updateStatus = "¡Nueva versión ${info.latestVersion} disponible! Actual: ${info.currentVersion}. Toca DESCARGAR y luego INSTALAR, se actualizará solo sin desinstalar."
+                                                updateStatus = "¡Nueva versión ${info.latestVersion} disponible! Actual: ${info.currentVersion}. Toca DESCARGAR y luego INSTALAR, se actualizará solo."
                                             } else if (info.error != null) {
                                                 updateStatus = info.error + " Versión actual: ${info.currentVersion}"
-                                                updateAvailable = false
                                             } else {
-                                                updateStatus = "Ya tienes la última versión (${info.currentVersion}). Al tocar el APK nuevo, se actualiza solo."
-                                                updateAvailable = false
+                                                updateStatus = "Ya tienes la última versión (${info.currentVersion}). Al tocar el APK nuevo, se actualiza solo sin desinstalar."
                                             }
                                         }
-                                    }) { Text("BUSCAR") }
+                                    }) { Text("BUSCAR APK") }
 
                                     if (updateAvailable) {
                                         Button(onClick = {
                                             scope.launch {
                                                 val info = UpdateManager.checkForUpdate(context)
                                                 val url = info.downloadUrl ?: return@launch
-                                                isDownloading = true
-                                                downloadProgress = 0
+                                                isApkDownloading = true
+                                                apkDownloadProgress = 0
                                                 updateStatus = "Descargando ${info.latestVersion}..."
-                                                val result = UpdateManager.downloadAndInstall(context, url) { prog -> downloadProgress = prog }
+                                                val result = UpdateManager.downloadAndInstall(context, url) { prog -> apkDownloadProgress = prog }
                                                 updateStatus = result
-                                                isDownloading = false
+                                                isApkDownloading = false
                                             }
-                                        }) { Text("DESCARGAR E INSTALAR") }
+                                        }) { Text("DESCARGAR") }
                                     }
                                 }
-                                Text(
-                                    "Nota: No necesitas desinstalar. Solo toca el APK y elige Actualizar. No se descarga ningún modelo pesado, Gemini está en la nube.",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    modifier = Modifier.padding(top = 6.dp)
-                                )
                             }
                         }
 
@@ -149,6 +187,7 @@ class MainActivity : ComponentActivity() {
                             onClick = { if (!ready) requestPermissionsIfNeeded() else send(KarbysService.ACTION_LISTEN) },
                             modifier = Modifier.size(230.dp).semantics { contentDescription = "Hablar con Karbys" }
                         ) { Text(if (ready) "HABLAR" else "KARBYS") }
+                        Text(lastKarbys)
 
                         OutlinedTextField(
                             value = prompt, onValueChange = { prompt = it },
@@ -174,8 +213,9 @@ class MainActivity : ComponentActivity() {
                             Switch(checked = buzzer, onCheckedChange = { buzzer = it; sendConfig() })
                         }
 
-                        Text("Derecha: ${cm(right)}   Izquierda: ${cm(left)}   Atrás: ${cm(rear)}")
-                        Text("TF-Luna: ${cm(tf)}   Más cercano: ${cm(closest)}")
+                        Text("Frente: ${cm(tf)}   Derecha: ${cm(right)}   Izquierda: ${cm(left)}   Atrás: ${cm(rear)}")
+                        Text("Más cercano: ${cm(closest)}")
+                        Text("Temperatura: $temp   Humedad: $hum")
                         Text("Batería: $battery%")
                         Text("GPS: $locationText")
                         Spacer(Modifier.height(12.dp))
@@ -186,12 +226,80 @@ class MainActivity : ComponentActivity() {
                         }
                         if (paused) Button(onClick = { requestPermissionsIfNeeded() }) { Text("ACTIVAR KARBYS") }
 
-                        Spacer(Modifier.height(20.dp))
-                        Card(Modifier.fillMaxWidth()) {
-                            Column(Modifier.padding(12.dp)) {
-                                Text("Compatibilidad", style = MaterialTheme.typography.titleSmall)
-                                Text(deviceCheck, style = MaterialTheme.typography.bodySmall)
-                                Text("Modelo Gemini: compatible automático (2.0-flash -> 1.5-flash). No se descarga modelo local.", style = MaterialTheme.typography.bodySmall)
+                        HorizontalDivider(Modifier.padding(vertical = 18.dp))
+                        Text("AJUSTES DE KARBYS", style = MaterialTheme.typography.titleLarge)
+                        Text(if (keyConfigured) "Clave de Gemini guardada (modelos arreglados: 2.0-flash, 1.5-flash)" else "Falta clave Gemini: usa modo LOCAL o guarda clave. Modelos ya compatibles con gama media.")
+                        OutlinedTextField(
+                            value = keyDraft, onValueChange = { keyDraft = it },
+                            modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                            label = { Text("Clave de Gemini (AI Studio)") },
+                            singleLine = true
+                        )
+                        OutlinedTextField(
+                            value = modelDraft, onValueChange = { modelDraft = it },
+                            modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+                            label = { Text("Modelo Gemini (opcional): ${GeminiClient.models(this@MainActivity).joinToString()}") },
+                            singleLine = true
+                        )
+                        Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { saveSettings() }, modifier = Modifier.weight(1f)) { Text("GUARDAR") }
+                            Button(onClick = { send(KarbysService.ACTION_GREETING) }, modifier = Modifier.weight(1f)) { Text("SALUDAR") }
+                        }
+
+                        HorizontalDivider(Modifier.padding(vertical = 18.dp))
+                        Text("CEREBRO DE KARBYS - LOCAL COMPATIBLE", style = MaterialTheme.typography.titleLarge)
+                        Text("Para gama media-alta recomendamos Q3 (924 MB) o Q2 (752 MB). Q4_K_M solo si tienes 6GB+.", style = MaterialTheme.typography.bodySmall)
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Button(onClick = { pickBrain(Prefs.BRAIN_LOCAL) }, modifier = Modifier.weight(1f)) { Text("LOCAL") }
+                            Button(onClick = { pickBrain(Prefs.BRAIN_AUTO) }, modifier = Modifier.weight(1f)) { Text("AUTO") }
+                            Button(onClick = { pickBrain(Prefs.BRAIN_CLOUD) }, modifier = Modifier.weight(1f)) { Text("NUBE") }
+                        }
+                        Text("Modo: ${brainLabel(brainMode)}")
+                        Text(quantLabel)
+                        Text(modelStatus())
+                        if (downloading) {
+                            LinearProgressIndicator(
+                                progress = { modelPercent },
+                                modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
+                            )
+                            if (modelLabel.isNotBlank()) Text(modelLabel)
+                        }
+                        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Button(onClick = { toggleDownload() }, modifier = Modifier.weight(1f)) {
+                                Text(if (downloading) "CANCELAR" else "DESCARGAR IA")
+                            }
+                            Button(onClick = { deleteModel() }, modifier = Modifier.weight(1f)) { Text("BORRAR") }
+                        }
+                        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Button(onClick = { nextQuant() }, modifier = Modifier.weight(1f)) { Text("OTRA VERSIÓN") }
+                            Button(onClick = {
+                                val best = ModelManager.bestModelForThisPhone(context)
+                                Prefs.selectQuantization(context, best.fileName, best.url)
+                                refreshModelStatus()
+                                deviceNote = "Sugerido para tu gama media-alta: ${best.fileName} (${best.megabytes} MB)"
+                            }, modifier = Modifier.weight(1f)) { Text("AUTO GAMA MEDIA") }
+                        }
+                        Button(onClick = { sendText("preséntate en una frase corta") }, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                            Text("PROBAR EL CEREBRO")
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Usar GPU (puede fallar en gama media, desactívalo si falla)")
+                            Spacer(Modifier.width(12.dp))
+                            Switch(checked = gpuPref, onCheckedChange = { gpuPref = it; Prefs.setUseGpu(this@MainActivity, it) })
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Avisarme los obstáculos con la voz")
+                            Spacer(Modifier.width(12.dp))
+                            Switch(
+                                checked = voiceAlertPref,
+                                onCheckedChange = { voiceAlertPref = it; Prefs.setVoiceAlerts(this@MainActivity, it) }
+                            )
+                        }
+                        Text("Teléfono: ${LocalBrain.deviceSummary(this@MainActivity)}", style = MaterialTheme.typography.bodySmall)
+                        Text("Compatibilidad: $deviceCheck", style = MaterialTheme.typography.bodySmall)
+                        if (deviceNote.isNotBlank()) {
+                            Card(Modifier.fillMaxWidth().padding(top = 6.dp), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+                                Text(deviceNote, modifier = Modifier.padding(8.dp), style = MaterialTheme.typography.bodySmall)
                             }
                         }
                     }
@@ -200,15 +308,15 @@ class MainActivity : ComponentActivity() {
         }
         requestPermissionsIfNeeded()
 
-        // Auto-check actualización al iniciar (silencioso)
-        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+        // Auto-check APK actualización silencioso
+        uiScope.launch(Dispatchers.IO) {
             try {
                 val info = UpdateManager.checkForUpdate(this@MainActivity)
-                launch(kotlinx.coroutines.Dispatchers.Main) {
+                launch(Dispatchers.Main) {
                     if (info.available) {
                         updateAvailable = true
                         latestVersion = info.latestVersion
-                        updateStatus = "Nueva versión ${info.latestVersion} disponible. Toca DESCARGAR."
+                        updateStatus = "Nueva APK ${info.latestVersion} disponible."
                     }
                 }
             } catch (_: Exception) {}
@@ -216,48 +324,114 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun checkDeviceCompatibility() {
-        val sb = StringBuilder()
-        val ram = try {
-            val actManager = getSystemService(ACTIVITY_SERVICE) as android.app.ActivityManager
-            val memInfo = android.app.ActivityManager.MemoryInfo()
-            actManager.getMemoryInfo(memInfo)
-            memInfo.totalMem / (1024 * 1024)
-        } catch (_: Exception) { -1L }
-
-        val hasSpeech = SpeechRecognizer.isRecognitionAvailable(this)
-        val hasTts = try {
-            val intent = Intent(TextToSpeech.Engine.ACTION_CHECK_TTS_DATA)
-            packageManager.queryIntentActivities(intent, 0).isNotEmpty()
-        } catch (_: Exception) { false }
-
+        val ram = ModelManager.totalRamMegabytes(this)
+        val is64 = ModelManager.hasCpuForEngine(this)
         val cores = Runtime.getRuntime().availableProcessors()
-        val androidVer = Build.VERSION.SDK_INT
-
-        sb.append("Android $androidVer, $cores núcleos")
-        if (ram > 0) sb.append(", ${ram}MB RAM")
-        sb.append(". ")
-
-        if (!hasSpeech) sb.append("Instala Google app para voz. ")
-        if (!hasTts) sb.append("Instala Google TTS. ")
-
-        // Todo gama media-alta debería pasar
-        if (androidVer >= 26 && cores >= 4) {
-            sb.append("✓ Compatible con WayCore.")
-        } else if (androidVer >= 26) {
-            sb.append("✓ Compatible (mínimo).")
-        } else {
-            sb.append("✗ Android muy viejo, necesita 8.0+")
-        }
-
-        // Chequeo de Gemini: ya no hay modelo local, por eso siempre compatible
-        sb.append(" Gemini en nube, sin descarga local.")
-
+        val sb = StringBuilder()
+        sb.append("Android ${android.os.Build.VERSION.SDK_INT}, $cores núcleos, $ram MB RAM, ${if (is64) "64-bit ✓" else "32-bit ✗"}. ")
+        if (!is64) sb.append("Motor local no compatible, usa NUBE (Gemini ya arreglado). ")
+        else if (ram >= 5500) sb.append("Gama alta, usa Q4_K_M. ")
+        else if (ram >= 4000) sb.append("Gama media-alta ideal para Q3 (recomendado). ")
+        else if (ram >= 3000) sb.append("Gama media, usa Q2. ")
+        else sb.append("Gama baja, usa 0.5B o NUBE. ")
+        sb.append("APK se actualiza con un toque.")
         deviceCheck = sb.toString()
     }
 
+    override fun onResume() {
+        super.onResume()
+        updateDeviceInfo()
+        keyConfigured = Prefs.hasApiKey(this)
+        refreshModelStatus()
+    }
+
     override fun onDestroy() {
-        unregisterReceiver(receiver)
+        uiScope.cancel()
+        try { unregisterReceiver(receiver) } catch (_: Exception) { }
         super.onDestroy()
+    }
+
+    private fun saveSettings() {
+        Prefs.setApiKey(this, keyDraft.trim())
+        Prefs.setModel(this, modelDraft.trim())
+        keyConfigured = Prefs.hasApiKey(this)
+        deviceNote = ""
+    }
+
+    private fun pickBrain(mode: String) {
+        Prefs.setBrainMode(this, mode)
+        brainMode = mode
+    }
+
+    private fun brainLabel(mode: String): String = when (mode) {
+        Prefs.BRAIN_LOCAL -> "solo el modelo del teléfono, sin Internet"
+        Prefs.BRAIN_CLOUD -> "solo Gemini por Internet (modelos arreglados)"
+        else -> "AUTO: local si está descargado, si no nube"
+    }
+
+    private fun modelStatus(): String {
+        val file = ModelManager.modelFile(this)
+        val spec = ModelManager.specFor(this)
+        return when {
+            modelReady -> "✓ Está en el teléfono: ${ModelManager.megabytes(file.length())} MB. Karbys piensa sin Internet."
+            downloading -> "Descargando ${spec.fileName}, no cierres la app."
+            else -> "Falta descargar: ${spec.fileName} (${spec.megabytes} MB). Hay ${ModelManager.freeMegabytes(this)} MB libres. RAM: ${ModelManager.totalRamMegabytes(this)} MB."
+        }
+    }
+
+    private fun toggleDownload() {
+        if (ModelTransferService.isBusy()) {
+            ModelTransferService.cancel(this)
+            downloading = false
+            return
+        }
+        // Para gama media-alta permitimos aunque RAM esté justa, solo bloqueamos 32-bit y <2.5GB
+        if (!ModelManager.hasCpuForEngine(this)) {
+            deviceNote = ModelManager.reasonItDoesNotFit(this)
+            return
+        }
+        val ram = ModelManager.totalRamMegabytes(this)
+        if (ram in 1..2499) {
+            deviceNote = ModelManager.reasonItDoesNotFit(this)
+            return
+        }
+        if (ram in 2500..3499 && ModelManager.specFor(this).minRamMegabytes > 3200) {
+            deviceNote = "Tu teléfono tiene $ram MB y el modelo pide ${ModelManager.specFor(this).minRamMegabytes} MB. Te recomiendo tocar AUTO GAMA MEDIA para elegir Q2 o 0.5B. Si quieres probar igual, toca de nuevo DESCARGAR IA."
+            // Permitir segundo intento
+            if (!deviceNote.contains("segundo")) {
+                // No bloquear, solo avisar
+            }
+        }
+        deviceNote = ""
+        ModelTransferService.start(this)
+        downloading = true
+    }
+
+    private fun deleteModel() {
+        uiScope.launch {
+            ModelManager.deleteModel(this@MainActivity)
+            downloading = false
+            modelPercent = 0f
+            refreshModelStatus()
+        }
+    }
+
+    private fun nextQuant() {
+        val specs = ModelManager.SPECS
+        val index = specs.indexOfFirst { it.fileName == ModelManager.specFor(this).fileName }
+        val next = specs[((if (index < 0) 0 else index) + 1) % specs.size]
+        Prefs.selectQuantization(this, next.fileName, next.url)
+        refreshModelStatus()
+    }
+
+    private fun refreshModelStatus() {
+        val spec = ModelManager.specFor(this)
+        modelReady = ModelManager.isReady(this)
+        quantLabel = spec.label
+        brainMode = Prefs.brainMode(this)
+        gpuPref = Prefs.useGpu(this)
+        voiceAlertPref = Prefs.voiceAlerts(this)
+        downloading = ModelTransferService.isBusy()
     }
 
     private fun requestPermissionsIfNeeded() {
@@ -297,9 +471,11 @@ class MainActivity : ComponentActivity() {
             val o = JSONObject(line)
             right = o.optInt("right", right); left = o.optInt("left", left); rear = o.optInt("rear", rear)
             tf = o.optInt("tf", tf); closest = o.optInt("closest", closest)
-            threshold = o.optInt("threshold", threshold)
+            threshold = o.optInt("threshold", threshold).coerceIn(20, 150)
             mode = o.optString("mode", mode)
             buzzer = o.optBoolean("buzzer", buzzer)
+            (o.opt("temp") as? Number)?.let { temp = "$it °C" }
+            (o.opt("hum") as? Number)?.let { hum = "$it %" }
         } catch (_: Exception) { }
     }
 
