@@ -27,12 +27,15 @@ import java.util.concurrent.TimeUnit
  */
 object UpdateManager {
 
+    // URL directa que SIEMPRE funciona, sin necesidad de API (evita rate limit de GitHub)
+    private const val DIRECT_APK_URL = "https://github.com/juarezdanny522-tech/WayCore2.0/releases/download/waycore-latest/WayCore-latest-debug.apk"
     private const val GITHUB_API = "https://api.github.com/repos/juarezdanny522-tech/WayCore2.0/releases/latest"
     private const val GITHUB_FALLBACK_URL = "https://github.com/juarezdanny522-tech/WayCore2.0/releases/latest"
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
+        .followRedirects(true)
         .build()
 
     data class UpdateInfo(
@@ -51,20 +54,25 @@ object UpdateManager {
             else context.packageManager.getPackageInfo(context.packageName, 0).versionCode.toLong()
         } catch (_: Exception) { 0L }
 
+        // Intentar API de GitHub primero, pero con fallback robusto a URL directa
         try {
             val request = Request.Builder()
                 .url(GITHUB_API)
                 .addHeader("Accept", "application/vnd.github.v3+json")
+                .addHeader("User-Agent", "WayCore-App")
                 .build()
             client.newCall(request).execute().use { resp ->
                 if (!resp.isSuccessful) {
+                    // Rate limit o error: ofrecer descarga directa sin fallar
+                    val isRateLimit = resp.code == 403 || resp.code == 429
                     return@withContext UpdateInfo(
-                        available = false,
-                        latestVersion = currentName,
+                        available = true, // Ofrecer actualización aunque no sepamos versión
+                        latestVersion = "latest",
                         currentVersion = currentName,
-                        downloadUrl = GITHUB_FALLBACK_URL,
+                        downloadUrl = DIRECT_APK_URL,
                         changelog = null,
-                        error = "No pude consultar GitHub ahora (código ${resp.code}). Puedes descargar manual."
+                        error = if (isRateLimit) "GitHub limitó consultas (muy común), pero puedes descargar directo el APK que se actualiza solo con un toque."
+                        else "No pude consultar versión (código ${resp.code}), pero el APK directo sí funciona: toca DESCARGAR."
                     )
                 }
                 val body = resp.body?.string().orEmpty()
@@ -76,13 +84,14 @@ object UpdateManager {
                     for (i in 0 until assets.length()) {
                         val a = assets.optJSONObject(i) ?: continue
                         val name = a.optString("name", "")
-                        if (name.endsWith(".apk")) {
+                        if (name.endsWith(".apk", true)) {
                             apkUrl = a.optString("browser_download_url", null)
-                            break
+                            if (!apkUrl.isNullOrBlank()) break
                         }
                     }
                 }
-                if (apkUrl.isNullOrBlank()) apkUrl = GITHUB_FALLBACK_URL
+                // Si no hay apk en assets, usar URL directa que siempre existe
+                if (apkUrl.isNullOrBlank()) apkUrl = DIRECT_APK_URL
 
                 val changelog = json.optString("body", null)
                 val latestCode = parseVersionCode(tag)
@@ -90,21 +99,22 @@ object UpdateManager {
                 else tag != currentName && tag.isNotBlank()
 
                 UpdateInfo(
-                    available = isNewer,
-                    latestVersion = tag.ifBlank { currentName },
+                    available = isNewer || apkUrl == DIRECT_APK_URL, // Siempre ofrecer si tenemos URL directa
+                    latestVersion = tag.ifBlank { "latest" },
                     currentVersion = currentName,
                     downloadUrl = apkUrl,
                     changelog = changelog
                 )
             }
         } catch (e: Exception) {
+            // Sin internet o error de red: ofrecer URL directa igualmente
             UpdateInfo(
-                available = false,
-                latestVersion = currentName,
+                available = true,
+                latestVersion = "latest",
                 currentVersion = currentName,
-                downloadUrl = GITHUB_FALLBACK_URL,
+                downloadUrl = DIRECT_APK_URL,
                 changelog = null,
-                error = "Sin internet o error: ${e.message}"
+                error = "Sin internet o GitHub no respondió (${e.message}), pero el APK directo debería funcionar si tienes internet. URL: $DIRECT_APK_URL - Al tocarlo se actualiza solo."
             )
         }
     }

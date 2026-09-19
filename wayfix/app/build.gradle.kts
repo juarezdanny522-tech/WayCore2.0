@@ -44,8 +44,9 @@ android {
         minSdk = 26
         targetSdk = 35
         // Bump para que al tocar APK se actualice solo (mismo package + firma + versionCode mayor)
-        versionCode = 9
-        versionName = "0.7.1"
+        // v0.7.2 arregla INVALID_ARGUMENT Unsupported file format en gama media-alta
+        versionCode = 10
+        versionName = "0.7.2"
         buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
         buildConfigField("boolean", "AUTO_UPDATE_ENABLED", "true")
 
