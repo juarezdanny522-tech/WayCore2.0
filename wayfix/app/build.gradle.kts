@@ -44,9 +44,10 @@ android {
         minSdk = 26
         targetSdk = 35
         // Bump para que al tocar APK se actualice solo (mismo package + firma + versionCode mayor)
-        // v0.7.2 arregla INVALID_ARGUMENT Unsupported file format en gama media-alta
-        versionCode = 10
-        versionName = "0.7.2"
+        // v0.7.3 arregla INVALID_ARGUMENT Unsupported file format -> cambia GGUF por .litertlm oficial Qwen3 0.6B
+        // y arregla 'archivo malicioso' + GitHub API rate limit con URL directa
+        versionCode = 11
+        versionName = "0.7.3"
         buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
         buildConfigField("boolean", "AUTO_UPDATE_ENABLED", "true")
 
@@ -129,10 +130,11 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
-    // Motor de inferencia local (llama.cpp por dentro) para el GGUF de Qwen.
-        // Versión fijada en vez de latest.release: 0.17.1 es la que se probó contra esta app.
-    // Si se sube, hay que volver a pasar las pruebas del motor (el AAR cambia su API).
-    implementation("com.google.ai.edge.litertlm:litertlm-android:0.17.1")
+    // Motor de inferencia local (llama.cpp por dentro) para .litertlm de Qwen.
+    // Antes usábamos GGUF que daba "Unsupported file format". Ahora usamos modelos oficiales
+    // litert-community/Qwen3-0.6B que son formato .litertlm 100% compatible.
+    // 0.13.1 es la última estable de 2026-06, más nueva que 0.17.1 que era alpha.
+    implementation("com.google.ai.edge.litertlm:litertlm-android:0.13.1")
 
     testImplementation("junit:junit:4.13.2")
     // En las pruebas de JVM org.json no viene del framework de Android.
