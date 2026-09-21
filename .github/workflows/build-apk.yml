@@ -64,6 +64,27 @@ jobs:
           path: build.log
           if-no-files-found: warn
 
+      - name: Report error to commit
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "## Autodiagnostico de compilacion"
+            echo ""
+            echo "Errores detectados:"
+            echo '```'
+            grep -aE "error:|FAILED|Execution failed|What went wrong|Could not |Unable to resolve|e: " build.log | head -50
+            echo '```'
+            echo ""
+            echo "Ultimas 60 lineas:"
+            echo '```'
+            tail -60 build.log
+            echo '```'
+          } > /tmp/report.md
+          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/comments" -F body=@/tmp/report.md > /dev/null
+          echo "Reporte publicado en el commit."
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
