@@ -85,7 +85,6 @@ object LocalBrain {
                     val options = LlmInference.LlmInferenceOptions.builder()
                         .setModelPath(file.absolutePath)
                         .setMaxTokens(MAX_TOKENS)
-                        .setTopK(TOP_K)
                         .setTemperature(TEMPERATURE)
                         .setRandomSeed(SEED)
                         .build()
