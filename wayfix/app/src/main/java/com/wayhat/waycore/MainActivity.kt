@@ -163,15 +163,15 @@ class MainActivity : ComponentActivity() {
                                 Spacer(Modifier.height(8.dp))
                                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                     Button(
-                                        onClick = { setEngineMode(LocalModelManager.MODE_AUTO) },
+                                        onClick = { applyEngineMode(LocalModelManager.MODE_AUTO) },
                                         modifier = Modifier.weight(1f).semantics { contentDescription = "Modo automático" }
                                     ) { Text(if (engineMode == LocalModelManager.MODE_AUTO) "● Auto" else "Auto") }
                                     Button(
-                                        onClick = { setEngineMode(LocalModelManager.MODE_LOCAL) },
+                                        onClick = { applyEngineMode(LocalModelManager.MODE_LOCAL) },
                                         modifier = Modifier.weight(1f).semantics { contentDescription = "Solo IA local" }
                                     ) { Text(if (engineMode == LocalModelManager.MODE_LOCAL) "● Local" else "Local") }
                                     Button(
-                                        onClick = { setEngineMode(LocalModelManager.MODE_GEMINI) },
+                                        onClick = { applyEngineMode(LocalModelManager.MODE_GEMINI) },
                                         modifier = Modifier.weight(1f).semantics { contentDescription = "Solo Gemini" }
                                     ) { Text(if (engineMode == LocalModelManager.MODE_GEMINI) "● Nube" else "Nube") }
                                 }
@@ -399,7 +399,7 @@ class MainActivity : ComponentActivity() {
         ContextCompat.startForegroundService(this, Intent(this, WayHatService::class.java).setAction(WayHatService.ACTION_START))
     }
 
-    private fun setEngineMode(m: String) {
+    private fun applyEngineMode(m: String) {
         engineMode = m
         LocalModelManager.setMode(this, m)
         ContextCompat.startForegroundService(
