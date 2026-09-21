@@ -6,6 +6,8 @@ import android.content.*
 import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.media.*
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.*
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -29,8 +31,24 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
         const val ACTION_GREETING = "GREETING"
         const val ACTION_REMINDER = "REMINDER"
         const val ACTION_TEXT = "TEXT"
+        const val ACTION_TEST_VOICE = "TEST_VOICE"
+        const val ACTION_DIAGNOSE = "DIAGNOSE"
+        const val ACTION_SET_MODE = "SET_MODE"
+        const val ACTION_RELOAD_MODEL = "RELOAD_MODEL"
         const val CHANNEL = "karbys_assistant"
         const val NOTIFICATION_ID = 2401
+
+        /** Registro visible: la UI muestra todo aunque falle el audio. */
+        const val ACTION_LOG = "com.wayhat.waycore.KARBYS_LOG"
+        const val EXTRA_KIND = "kind" // user | karbys | status | error
+        const val EXTRA_TEXT = "text"
+        const val EXTRA_SOURCE = "source"
+
+        const val ACTION_DIAG = "com.wayhat.waycore.KARBYS_DIAG"
+        const val EXTRA_DIAG_LINES = "lines"
+
+        const val EXTRA_MODE = "mode"
+
         private const val CONTINUATION_SILENCE_MS = 4500L
         private const val CONTINUATION_WINDOW_MS = 6000L
         private const val COMMAND_RETRY_DELAY_MS = 180L
@@ -38,6 +56,9 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
 
     private var recognizer: SpeechRecognizer? = null
     private lateinit var tts: TextToSpeech
+    private var ttsReady = false
+    private var ttsFailed = false
+    private var ttsLangDesc = "iniciando…"
     private var hotwordMode = true
     private var processing = false
     private var pausedByUser = false
@@ -79,7 +100,10 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
                 }
             }
             override fun onError(utteranceId: String?) {
-                if (utteranceId == "karbys-answer") main.post { beginContinuationWindow() }
+                if (utteranceId == "karbys-answer") {
+                    log("error", "El motor de voz no pudo reproducir la respuesta.")
+                    main.post { beginContinuationWindow() }
+                }
             }
         })
 
@@ -106,15 +130,40 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
                 }
             }
             ACTION_GREETING -> firstGreeting()
+            ACTION_TEST_VOICE -> testVoice()
+            ACTION_DIAGNOSE -> runDiagnostics()
+            ACTION_SET_MODE -> {
+                val m = intent?.getStringExtra(EXTRA_MODE).orEmpty()
+                if (m.isNotBlank()) {
+                    LocalModelManager.setMode(this, m)
+                    log("status", "Motor cambiado a: ${LocalModelManager.modeLabel(LocalModelManager.getMode(this))}")
+                }
+            }
+            ACTION_RELOAD_MODEL -> reloadLocalModel()
             ACTION_REMINDER -> {
                 val label = intent?.getStringExtra("label") ?: "tu recordatorio"
                 main.post {
                     beepAlert()
-                    speak("Recordatorio: $label.")
+                    speak("Recordatorio: $label.", source = "Recordatorio")
                 }
             }
         }
         return START_STICKY
+    }
+
+    // ------------------------------------------------------------------
+    // Registro visible (la UI lo muestra línea por línea)
+    // ------------------------------------------------------------------
+
+    private fun log(kind: String, text: String, source: String = "") {
+        try {
+            sendBroadcast(
+                Intent(ACTION_LOG).setPackage(packageName)
+                    .putExtra(EXTRA_KIND, kind)
+                    .putExtra(EXTRA_TEXT, text)
+                    .putExtra(EXTRA_SOURCE, source)
+            )
+        } catch (_: Exception) { }
     }
 
     private fun createNotificationChannel() {
@@ -147,7 +196,10 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun createRecognizer(hotword: Boolean): SpeechRecognizer? {
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) return null
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            log("error", "Reconocimiento de voz no disponible. Instala o actualiza la app de Google; mientras tanto usa el botón HABLAR por texto.")
+            return null
+        }
 
         destroyRecognizer()
         val generation = recognizerGeneration
@@ -247,14 +299,10 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
         )
         val wakeWords = listOf("oye", "hey", "ei", "ey", "oiga", "hola", "hoy")
 
-        // First accept the exact/near-exact wake phrase. Android speech
-        // recognition often changes the spelling of "Karbys".
         for (name in names) {
             if (wakeWords.any { w -> n.contains("$w $name") }) return true
         }
 
-        // Also accept just the assistant name. This makes the wake word
-        // reliable when the recognizer drops the first word ("oye").
         return names.any { name ->
             n == name || n.contains(" $name") || n.startsWith("$name ")
         }
@@ -271,7 +319,7 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
         val prefs = getSharedPreferences("waycore", MODE_PRIVATE)
         if (!prefs.getBoolean("greeted", false)) {
             prefs.edit().putBoolean("greeted", true).apply()
-            main.postDelayed({ speak("Hola, te estuve esperando. Aquí estoy para ti.") }, 500)
+            main.postDelayed({ speak("Hola, te estuve esperando. Aquí estoy para ti.", source = "Saludo") }, 500)
         } else startHotword()
     }
 
@@ -307,8 +355,15 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
 
     private fun beginCommandListening(playBeep: Boolean = true) {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            speak("Necesito permiso para usar el micrófono.")
+            speak("Necesito permiso para usar el micrófono.", source = "Sistema")
             startHotword()
+            return
+        }
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            speak(
+                "El dictado por voz no está disponible en este celular. Escríbeme con el teclado y te respondo igual.",
+                source = "Sistema"
+            )
             return
         }
         hotwordMode = false
@@ -316,6 +371,7 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
         conversationMode = true
         cancelContinuationTimeout()
         if (playBeep) beepStart()
+        log("status", "Te escucho… habla ahora.")
 
         main.post {
             if (pausedByUser || processing || !conversationMode) return@post
@@ -341,12 +397,21 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
         putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "es-MX")
         putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, partial)
         putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        // Prefiere el paquete sin internet si está instalado; si no, usa la nube.
+        putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
         putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, silence)
         putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, silence)
     }
 
     private fun beginContinuationWindow() {
         if (pausedByUser || processing) return
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            // Sin dictado no se puede escuchar: quedar quieto (el texto sigue funcionando).
+            processing = false
+            conversationMode = false
+            hotwordMode = false
+            return
+        }
         processing = false
         conversationMode = true
         hotwordMode = false
@@ -357,13 +422,6 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
         }, 140)
     }
 
-    /**
-     * Android's SpeechRecognizer can report ERROR_NO_MATCH/ERROR_SPEECH_TIMEOUT
-     * immediately on some phones even when the silence timeout is configured.
-     * During the post-answer conversation window we therefore retry silently
-     * instead of ending the conversation. This is what makes Karbys feel like
-     * an ongoing voice call rather than a push-to-talk interaction.
-     */
     private fun retryConversationListeningOrFinish() {
         if (pausedByUser || processing || !conversationMode) return
 
@@ -401,19 +459,103 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
         }, 700)
     }
 
+    // ------------------------------------------------------------------
+    // Cerebro: reglas locales -> IA local -> Gemini -> respaldo offline.
+    // Siempre responde algo; cada respuesta indica su fuente.
+    // ------------------------------------------------------------------
+
     private fun askKarbys(text: String) {
         processing = true
         continuationDeadline = 0L
         val clean = text.trim()
+        log("user", clean)
         scope.launch {
+            val mode = LocalModelManager.getMode(this@KarbysService)
+
+            // 1) Comandos locales instantáneos (siempre offline).
             val direct = executeLocalCommand(clean)
-            val answer = direct ?: GeminiClient.ask(clean, memory.toList(), buildDeviceContext())
-            memory.add(ConversationTurn(clean, answer))
-            while (memory.size > 4) memory.removeAt(0)
-            withContext(Dispatchers.Main) {
-                processing = false
-                speak(answer)
+            if (direct != null) {
+                said(clean, direct, "Regla local")
+                return@launch
             }
+
+            // 2) IA local (sin internet).
+            if (mode == LocalModelManager.MODE_AUTO || mode == LocalModelManager.MODE_LOCAL) {
+                if (LocalModelManager.isModelReady(this@KarbysService)) {
+                    log("status", "Pensando con IA local (sin internet)…")
+                    val ans = LocalBrain.answer(this@KarbysService, buildLocalPrompt(clean))
+                    if (ans.ok) {
+                        said(clean, ans.text, "IA local · sin internet")
+                        return@launch
+                    }
+                    log("error", "IA local falló: ${ans.text}")
+                    if (mode == LocalModelManager.MODE_LOCAL) {
+                        said(
+                            clean,
+                            "No pude usar la IA local: ${ans.text} Revisa el panel IA local de la pantalla.",
+                            "IA local"
+                        )
+                        return@launch
+                    }
+                } else {
+                    if (mode == LocalModelManager.MODE_LOCAL) {
+                        said(
+                            clean,
+                            "Aún no hay modelo local instalado. Abre el panel IA local y descarga el modelo, pesa unos 320 MB.",
+                            "IA local"
+                        )
+                        return@launch
+                    }
+                    log("status", "Sin modelo local instalado. Intentando con Gemini…")
+                }
+            }
+
+            // 3) Gemini (nube).
+            if (mode == LocalModelManager.MODE_AUTO || mode == LocalModelManager.MODE_GEMINI) {
+                val key = BuildConfig.GEMINI_API_KEY.trim()
+                if (key.isBlank()) {
+                    log("error", "Sin clave de Gemini configurada.")
+                    if (mode == LocalModelManager.MODE_GEMINI) {
+                        said(
+                            clean,
+                            "Falta configurar la clave de Gemini en WayCore. Cambia a modo automático o instala la IA local.",
+                            "Gemini"
+                        )
+                        return@launch
+                    }
+                } else if (!hasNetwork()) {
+                    log("error", "Sin internet para usar Gemini.")
+                    if (mode == LocalModelManager.MODE_GEMINI) {
+                        said(clean, "No hay conexión a internet para usar Gemini.", "Gemini")
+                        return@launch
+                    }
+                } else {
+                    log("status", "Consultando a Gemini…")
+                    val cloudPrefs = getSharedPreferences("waycore_cloud", MODE_PRIVATE)
+                    val res = GeminiClient.askDetailed(clean, memory.toList(), buildDeviceContext(), cloudPrefs)
+                    if (res.error == null) {
+                        said(clean, res.text, "Gemini · ${res.model ?: "nube"}")
+                        return@launch
+                    }
+                    log("error", "Gemini falló: ${res.error}")
+                    if (mode == LocalModelManager.MODE_GEMINI) {
+                        said(clean, res.text, "Gemini")
+                        return@launch
+                    }
+                }
+            }
+
+            // 4) Respaldo offline garantizado: nunca quedarse callado.
+            said(clean, offlineFallbackAnswer(clean), "Offline")
+        }
+    }
+
+    private suspend fun said(user: String, text: String, source: String) {
+        memory.add(ConversationTurn(user, text))
+        while (memory.size > 4) memory.removeAt(0)
+        withContext(Dispatchers.Main) {
+            processing = false
+            speak(text, source = source)
         }
     }
 
@@ -447,11 +589,73 @@ class KarbysService : Service(), TextToSpeech.OnInitListener {
             }
             n.contains("actualiza los sensores") || n.contains("actualiza wayhat") -> WayHatService.executeTool("refresh_wayhat_telemetry", JSONObject())
             n.contains("prueba el buzzer") || n.contains("prueba el sonido de wayhat") -> WayHatService.executeTool("test_wayhat_alert", JSONObject())
+            n == "hola" || n == "buenos dias" || n == "buenas tardes" || n == "buenas noches" ||
+                n == "hola karbys" || n == "oye karbys" || n == "hey karbys" -> "¡Hola! ¿En qué te ayudo?"
+            n.contains("como estas") || n.contains("como te encuentras") -> "Muy bien, lista para ayudarte. ¿Qué necesitas?"
+            n == "gracias" || n.startsWith("gracias ") || n.contains("muchas gracias") -> "¡Con gusto! Para eso estoy."
+            n.contains("adios") || n.contains("hasta luego") || n.contains("nos vemos") -> "¡Hasta luego! Aquí estaré cuando me necesites."
+            n.contains("quien eres") || n.contains("tu nombre") || n.contains("como te llamas") ->
+                "Soy Karbys, tu asistente de voz de WayCore, un producto de WayCorp. Puedo conversar, ayudarte con WayHat, darte la hora, la batería y programar recordatorios, incluso sin internet si tienes la IA local instalada."
+            n.contains("quien te cre") || n.contains("quienes te crearon") || n.contains("tu equipo") ||
+                n.contains("waycorp") || n.contains("origen del proyecto") || n.contains("historia del proyecto") ->
+                "WayCore fue creado con amor para todos. Danny Joel Castro Juárez lidera el software y la integración de Karbys. Dennis Alexander es desarrollador de hardware. Daylin Odalis es portavoz y documentadora. Emely Denisse es diseñadora y documentadora. Y agradecen a la licenciada Gloria Yessenia Mármol de Muñoz."
+            n.contains("que puedes hacer") || n == "ayuda" || n.contains("ayuda karbys") ||
+                n.contains("para que sirves") || n.contains("tus funciones") ->
+                "Puedo conversar contigo, decirte la hora, la fecha, la batería y tu ubicación. Controlo WayHat: modo seguro o charla, avisos, sensibilidad y estado de sensores. También programo recordatorios. Dime qué necesitas."
             n.contains("cancela todas las alarmas") || n.contains("borra todos los recordatorios") -> {
                 ReminderStore.clear(this)
                 "Listo. Eliminé tus recordatorios programados."
             }
             else -> null
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Prompt compacto para el modelo pequeño local (un 270M necesita
+    // instrucciones cortas y contexto breve para no divagar).
+    // ------------------------------------------------------------------
+
+    private fun buildLocalPrompt(user: String): String {
+        val history = if (memory.isEmpty()) "" else memory.takeLast(2).joinToString("\n") {
+            "Usuario: ${it.user.take(220)}\nKarbys: ${it.assistant.take(220)}"
+        }
+        return """
+Eres Karbys, asistente de voz en español de El Salvador. Hablas con calidez, en 1 o 2 frases cortas para ser escuchadas. Sin listas, sin emojis, sin markdown. Nunca inventes datos de sensores: usa solo los datos reales de abajo.
+
+Datos reales: ${buildLocalContext()}
+
+${if (history.isBlank()) "" else "Conversación reciente:\n$history\n"}
+Usuario: ${user.take(400)}
+Karbys:""".trimIndent()
+    }
+
+    private fun buildLocalContext(): String {
+        val battery = run {
+            val intent = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+            val level = intent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
+            val scale = intent?.getIntExtra(BatteryManager.EXTRA_SCALE, 100) ?: 100
+            if (level >= 0 && scale > 0) "${level * 100 / scale}%" else "no disponible"
+        }
+        val time = SimpleDateFormat("h:mm a", Locale("es", "MX")).format(Date())
+        val wayhat = try {
+            val o = JSONObject(WayHatService.telemetrySnapshot())
+            if (!o.optBoolean("available", false)) "WayHat desconectado"
+            else "WayHat conectado, modo ${o.optString("mode", "?")}, más cercano ${o.optInt("closest", -1)} cm " +
+                "(der ${o.optInt("right", -1)}, izq ${o.optInt("left", -1)}, atrás ${o.optInt("rear", -1)}, TF ${o.optInt("tf", -1)}), " +
+                "sensibilidad ${o.optInt("threshold", 50)} cm"
+        } catch (_: Exception) { "WayHat sin datos" }
+        return "Hora $time. Batería del teléfono $battery. $wayhat."
+    }
+
+    private fun offlineFallbackAnswer(text: String): String {
+        val n = normalize(text)
+        return when {
+            n.contains("hola") || n.contains("buenos dias") || n.contains("buenas tardes") || n.contains("buenas noches") ->
+                "¡Hola! Estoy sin conexión a la nube, pero sigo aquí. Puedo darte la hora, la batería, el estado de WayHat o programar recordatorios."
+            n.contains("ayuda") || n.contains("que puedes hacer") ->
+                "Sin internet puedo decirte la hora, la fecha, la batería, tu ubicación y el estado de WayHat. También programo recordatorios y controlo el modo seguro o charla."
+            else ->
+                "Estoy sin conexión a la nube y la IA local no respondió. Puedo ayudarte con la hora, la batería, WayHat o recordatorios. Dime qué necesitas."
         }
     }
 
@@ -524,6 +728,120 @@ Regla de seguridad: el TF-Luna tiene una zona de protección de mayor alcance qu
         return "Listo. Te recordaré ${parsed.label} a las $whenText."
     }
 
+    // ------------------------------------------------------------------
+    // Voz (TTS) a prueba de fallos + diagnóstico
+    // ------------------------------------------------------------------
+
+    private fun testVoice() {
+        scope.launch {
+            log("status", "Probando voz…")
+            withContext(Dispatchers.Main) {
+                processing = false
+                speak("Hola, soy Karbys. Si me escuchas, la voz está funcionando perfectamente.", source = "Prueba de voz")
+            }
+        }
+    }
+
+    private fun reloadLocalModel() {
+        scope.launch {
+            log("status", "Recargando modelo de IA local…")
+            LocalBrain.release()
+            val ok = LocalBrain.ensureLoaded(this@KarbysService)
+            withContext(Dispatchers.Main) {
+                if (ok) {
+                    log("status", "Modelo de IA local cargado y listo.")
+                    speak("Modelo de IA local listo.", source = "IA local")
+                } else {
+                    val err = LocalBrain.lastError ?: "No hay modelo instalado."
+                    log("error", "No se pudo cargar la IA local: $err")
+                    speak("No pude cargar la IA local. $err", source = "IA local")
+                }
+            }
+        }
+    }
+
+    private fun hasNetwork(): Boolean {
+        return try {
+            val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+            val net = cm.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(net) ?: return false
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        } catch (_: Exception) {
+            true // Si no se puede comprobar, no bloquear la nube.
+        }
+    }
+
+    private fun runDiagnostics() {
+        scope.launch {
+            val lines = mutableListOf<String>()
+            fun line(ok: Boolean, text: String) = lines.add("${if (ok) "OK " else "FALLO "} $text")
+
+            // 1) TTS
+            line(!ttsFailed && ttsReady, "Voz (TTS): ${if (ttsFailed) "no disponible, instala Google TTS" else ttsLangDesc}")
+
+            // 2) Volumen
+            val vol = try { audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) } catch (_: Exception) { -1 }
+            val max = try { audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC) } catch (_: Exception) { -1 }
+            line(vol > 0, "Volumen multimedia: $vol de $max${if (vol <= 0) " (súbelo, por eso no se escucha)" else ""}")
+
+            // 3) Micrófono
+            val mic = ContextCompat.checkSelfPermission(this@KarbysService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+            line(mic, "Permiso de micrófono: ${if (mic) "concedido" else "denegado"}")
+
+            // 4) Dictado
+            val stt = try { SpeechRecognizer.isRecognitionAvailable(this@KarbysService) } catch (_: Exception) { false }
+            line(stt, "Dictado por voz: ${if (stt) "disponible" else "no disponible (actualiza la app de Google)"}")
+
+            // 5) Modelo local
+            val modelFile = LocalModelManager.anyModelFile(this@KarbysService)
+            line(modelFile != null, "IA local: ${modelFile?.let { "${it.name} (${LocalModelManager.formatMB(it.length())})" } ?: "sin modelo instalado"}")
+            if (modelFile != null && LocalBrain.lastError != null && LocalBrain.status(this@KarbysService) is LocalBrain.State.Error) {
+                line(false, "IA local: error al cargar (${LocalBrain.lastError})")
+            }
+
+            // 6) RAM
+            val mem = ActivityManager.MemoryInfo()
+            try { (getSystemService(ACTIVITY_SERVICE) as ActivityManager).getMemoryInfo(mem) } catch (_: Exception) { }
+            val totalGb = mem.totalMem / (1024.0 * 1024.0 * 1024.0)
+            line(totalGb >= 2.5, "RAM total: %.1f GB%s".format(totalGb, if (totalGb < 2.5) " (justa para IA local)" else ""))
+
+            // 7) CPU
+            val abi = try { Build.SUPPORTED_ABIS.firstOrNull().orEmpty() } catch (_: Exception) { "" }
+            line(abi.contains("arm64"), "CPU: ${abi.ifBlank { "desconocida" }}${if (!abi.contains("arm64")) " (la IA local requiere 64 bits)" else ""}")
+
+            // 8) Clave Gemini
+            val keyOk = BuildConfig.GEMINI_API_KEY.trim().isNotBlank()
+            line(keyOk, "Clave Gemini: ${if (keyOk) "configurada" else "no configurada (la nube no funcionará)"}")
+
+            // 9) Internet
+            val net = hasNetwork()
+            line(net, "Internet: ${if (net) "disponible" else "no disponible (solo funcionará la IA local)"}")
+
+            // 10) WayHat
+            val btOk = try {
+                JSONObject(WayHatService.telemetrySnapshot()).optBoolean("available", false)
+            } catch (_: Exception) { false }
+            line(btOk, "WayHat: ${if (btOk) "conectado" else "no conectado"}")
+
+            val fails = lines.count { it.startsWith("FALLO") }
+            withContext(Dispatchers.Main) {
+                try {
+                    sendBroadcast(
+                        Intent(ACTION_DIAG).setPackage(packageName)
+                            .putStringArrayListExtra(EXTRA_DIAG_LINES, ArrayList(lines))
+                    )
+                } catch (_: Exception) { }
+                lines.forEach { log("status", it) }
+                val summary = if (fails == 0) "Diagnóstico perfecto. Todo funciona." else {
+                    val first = lines.firstOrNull { it.startsWith("FALLO") }?.removePrefix("FALLO ") ?: ""
+                    "Diagnóstico: $fails puntos por revisar. Primero: $first"
+                }
+                speak(summary, source = "Diagnóstico")
+            }
+        }
+    }
+
     private fun registerBatteryMonitor() {
         batteryReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
@@ -535,7 +853,7 @@ Regla de seguridad: el TF-Luna tiene una zona de protección de mayor alcance qu
                     batteryWarningSent = true
                     main.post {
                         beepAlert()
-                        speak("Atención: la batería del celular está al cinco por ciento o menos. Conviene ponerlo a cargar.")
+                        speak("Atención: la batería del celular está al cinco por ciento o menos. Conviene ponerlo a cargar.", source = "Batería")
                     }
                 } else if (percent > 7) batteryWarningSent = false
             }
@@ -543,28 +861,16 @@ Regla de seguridad: el TF-Luna tiene una zona de protección de mayor alcance qu
         registerReceiver(batteryReceiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
     }
 
+    /**
+     * Enrutado de audio natural de Android.
+     *
+     * Antes se forzaba el modo llamada y Bluetooth SCO siempre, lo que en
+     * celulares SIN audífono conectado mandaba la voz a un dispositivo
+     * inexistente y Karbys "nunca hablaba". Ahora no se toca nada: si hay
+     * audífono, Android ya lo usa solo; si no, usa la bocina.
+     */
     private fun routeToHeadsetIfPossible() {
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val devices = audioManager.availableCommunicationDevices
-                val preferred = devices.firstOrNull { d ->
-                    d.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-                    d.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
-                    d.type == AudioDeviceInfo.TYPE_WIRED_HEADSET
-                }
-                if (preferred != null) {
-                    audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-                    audioManager.setCommunicationDevice(preferred)
-                }
-            } else {
-                @Suppress("DEPRECATION")
-                audioManager.isBluetoothScoOn = true
-                @Suppress("DEPRECATION")
-                audioManager.startBluetoothSco()
-                @Suppress("DEPRECATION")
-                audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            }
-        } catch (_: Exception) { }
+        // Intencionalmente vacío: no forzar SCO/modos. Ver comentario.
     }
 
     private fun beepStart() { try { tone?.startTone(ToneGenerator.TONE_PROP_BEEP, 120) } catch (_: Exception) {} }
@@ -573,19 +879,53 @@ Regla de seguridad: el TF-Luna tiene una zona de protección de mayor alcance qu
     private fun beepAlert() { try { tone?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 250) } catch (_: Exception) {} }
     private fun cancelContinuationTimeout() { continuationTimeout?.let(main::removeCallbacks); continuationTimeout = null }
 
-    private fun speak(text: String) {
-        pausedByUser = false
-        if (!::tts.isInitialized) { startHotword(); return }
-        hotwordMode = false
-        conversationMode = true
-        val spoken = text.replace("WayCore", "guaycor", ignoreCase = true)
-            .replace("WayHat", "guayjat", ignoreCase = true)
-            .replace("WayCorp", "guaycorp", ignoreCase = true)
+    private fun pronounce(text: String): String = text
+        .replace("WayCore", "guaycor", ignoreCase = true)
+        .replace("WayHat", "guayjat", ignoreCase = true)
+        .replace("WayCorp", "guaycorp", ignoreCase = true)
+
+    /**
+     * Habla el texto. Todo lo dicho TAMBIÉN queda en el registro visible,
+     * así que aunque el audio falle, el usuario ve la respuesta en pantalla.
+     */
+    private fun speak(text: String, source: String = "", clearPause: Boolean = true) {
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        if (clearPause) pausedByUser = false
+        log("karbys", clean, source)
+        if (!pausedByUser) {
+            hotwordMode = false
+            conversationMode = true
+        }
+        val spoken = pronounce(clean)
         beepReady()
-        main.postDelayed({
-            routeToHeadsetIfPossible()
-            tts.speak(spoken, TextToSpeech.QUEUE_FLUSH, null, "karbys-answer")
-        }, 80)
+        main.postDelayed({ deliverToTts(spoken, 0) }, 80)
+    }
+
+    private fun deliverToTts(spoken: String, attempt: Int) {
+        if (!::tts.isInitialized) return
+        if (ttsFailed) {
+            log("error", "Voz no disponible: instala 'Google TTS' y una voz en español. La respuesta está visible arriba.")
+            return
+        }
+        if (!ttsReady) {
+            // El motor tarda en iniciar: reintentar unos segundos.
+            if (attempt < 6) main.postDelayed({ deliverToTts(spoken, attempt + 1) }, 800)
+            else log("error", "El motor de voz no responde. Abre el diagnóstico para más detalles.")
+            return
+        }
+        try {
+            val vol = try { audioManager.getStreamVolume(AudioManager.STREAM_MUSIC) } catch (_: Exception) { 1 }
+            if (vol <= 0) log("error", "El volumen multimedia está en silencio: súbelo para escucharme.")
+            val res = tts.speak(spoken, TextToSpeech.QUEUE_FLUSH, null, "karbys-answer")
+            if (res == TextToSpeech.ERROR) {
+                log("error", "El motor de voz rechazó el texto.")
+                finishConversation()
+            }
+        } catch (e: Exception) {
+            log("error", "No pude reproducir la voz (${e.message}). La respuesta está visible arriba.")
+            finishConversation()
+        }
     }
 
     private fun stopEverything(message: Boolean) {
@@ -596,19 +936,41 @@ Regla de seguridad: el TF-Luna tiene una zona de protección de mayor alcance qu
         cancelContinuationTimeout()
         recognizer?.cancel()
         if (::tts.isInitialized) tts.stop()
-        if (message) speak("De acuerdo. Quedé en pausa. Cuando quieras, volvemos a hablar.")
+        if (message) speak(
+            "De acuerdo. Quedé en pausa. Cuando quieras, volvemos a hablar.",
+            source = "Sistema",
+            clearPause = false
+        )
     }
 
     override fun onInit(status: Int) {
-        if (status != TextToSpeech.SUCCESS) return
-        val preferred = listOf(Locale("es", "MX"), Locale("es", "US"), Locale("es", "CO"), Locale("es", "GT"), Locale("es", "CR"))
+        if (status != TextToSpeech.SUCCESS || !::tts.isInitialized) {
+            ttsReady = false
+            ttsFailed = true
+            ttsLangDesc = "motor no disponible"
+            log("error", "No se pudo iniciar el motor de voz. Instala 'Google TTS' desde Play Store.")
+            return
+        }
+        val preferred = listOf(Locale("es", "MX"), Locale("es", "US"), Locale("es", "ES"), Locale("es", "CO"), Locale("es", "GT"), Locale("es", "CR"), Locale("es"))
         val chosen = preferred.firstOrNull { tts.isLanguageAvailable(it) >= TextToSpeech.LANG_AVAILABLE }
-        if (chosen != null) tts.language = chosen
-        tts.voices?.firstOrNull { v ->
-            v.locale.language == "es" && preferred.any { p -> v.locale.country == p.country }
-        }?.let { tts.voice = it }
-        tts.setSpeechRate(0.93f)
-        tts.setPitch(1.04f)
+        if (chosen != null) {
+            try { tts.language = chosen } catch (_: Exception) { }
+            ttsLangDesc = "español (${chosen.displayCountry.ifBlank { chosen.displayLanguage }})"
+        } else {
+            ttsLangDesc = "idioma del sistema (descarga una voz en español para mejor calidad)"
+        }
+        try {
+            tts.voices?.firstOrNull { v ->
+                v.locale.language == "es" && preferred.any { p -> v.locale.country == p.country }
+            }?.let { tts.voice = it }
+        } catch (_: Exception) { }
+        try {
+            tts.setSpeechRate(0.93f)
+            tts.setPitch(1.04f)
+        } catch (_: Exception) { }
+        ttsReady = true
+        ttsFailed = false
+        log("status", "Voz lista: $ttsLangDesc.")
     }
 
     override fun onDestroy() {
@@ -616,8 +978,9 @@ Regla de seguridad: el TF-Luna tiene una zona de protección de mayor alcance qu
         destroyRecognizer()
         if (::tts.isInitialized) tts.shutdown()
         tone?.release(); tone = null
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) try { audioManager.clearCommunicationDevice() } catch (_: Exception) {}
         wakeLock?.let { if (it.isHeld) it.release() }; wakeLock = null
+        // El motor local se conserva en caché: si el servicio reinicia en el
+        // mismo proceso, responde al instante sin recargar el modelo.
         scope.cancel()
         super.onDestroy()
     }
@@ -725,4 +1088,3 @@ object ReminderScheduler {
         if (pi != null) am.cancel(pi)
     }
 }
-

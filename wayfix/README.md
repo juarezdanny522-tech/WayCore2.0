@@ -1,8 +1,20 @@
-# WayCore + WayHat v0.5.0 — Telemetría real y control por Gemini
+# WayCore + WayHat v0.4.0 — IA local sin internet + voz reparada + nube auto-reparable
+
+> **Para instalar la IA local en el celular, sigue la guía paso a paso: [`GUIA_IA_LOCAL.md`](GUIA_IA_LOCAL.md).**
 
 Esta versión usa la versión Bluetooth SPP estable anterior como base.
 
-## Nuevas funciones
+## Nuevo en v0.4.0
+
+- **IA local (MediaPipe + Gemma 270M)**: conversa sin internet tras descargar el modelo (~320 MB) desde la app o importarlo por USB.
+- **Voz a prueba de fallos**: se eliminó el desvío forzado a Bluetooth SCO que silenciaba a Karbys; verificación de motor, idioma y volumen con reintentos.
+- **Registro visible**: todo queda en pantalla con su fuente (IA local / Gemini / Regla local / Offline).
+- **Selector de motor**: Automático / Solo local / Solo nube.
+- **Diagnóstico de 10 puntos** hablado y visible.
+- **Gemini auto-reparable**: detecta modelos válidos con `models.list` (los nombres fijos viejos daban 404).
+- Respaldo offline garantizado: Karbys nunca se queda callado.
+
+## Funciones anteriores
 
 - Karbys recibe en cada consulta un contexto fresco con:
   - HC-SR04 derecho, izquierdo y trasero.
