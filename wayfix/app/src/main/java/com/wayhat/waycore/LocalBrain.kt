@@ -32,7 +32,6 @@ object LocalBrain {
     private const val MAX_TOKENS = 1024
     private const val TOP_K = 40
     private const val TEMPERATURE = 0.7f
-    private const val SEED = 7
     private const val ANSWER_TIMEOUT_MS = 150_000L
     private const val LOAD_TIMEOUT_MS = 120_000L
     private const val MAX_REPLY_CHARS = 800
@@ -82,11 +81,11 @@ object LocalBrain {
         return try {
             withContext(Dispatchers.Default) {
                 withTimeout(LOAD_TIMEOUT_MS) {
+                    // En tasks-genai 0.10.27 el muestreo (topK/temperatura) solo existe
+                    // en las opciones de sesión; aquí solo van modelo y tokens.
                     val options = LlmInference.LlmInferenceOptions.builder()
                         .setModelPath(file.absolutePath)
                         .setMaxTokens(MAX_TOKENS)
-                        .setTemperature(TEMPERATURE)
-                        .setRandomSeed(SEED)
                         .build()
                     engine = LlmInference.createFromOptions(ctx.applicationContext, options)
                 }
