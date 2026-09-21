@@ -1,0 +1,74 @@
+name: Build APK (WayCore)
+
+on:
+  push:
+    branches: ["arena/01a0c1fa-waycore2-0"]
+    paths:
+      - "wayfix/**"
+      - ".github/workflows/build-apk.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android packages
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('wayfix/**/*.gradle.kts', 'wayfix/gradle.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Install Gradle 8.11.1
+        run: |
+          curl -sL https://services.gradle.org/distributions/gradle-8.11.1-bin.zip -o /tmp/gradle.zip
+          sudo unzip -q /tmp/gradle.zip -d /opt
+          /opt/gradle-8.11.1/bin/gradle --version
+
+      - name: Build debug APK
+        working-directory: wayfix
+        run: /opt/gradle-8.11.1/bin/gradle :app:assembleDebug --no-daemon --stacktrace "-PGEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WayCore-debug-apk
+          path: wayfix/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Publish GitHub Release with APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.4.0-local-ai
+          name: WayCore v0.4.0 — IA local
+          body: |
+            APK de depuración con IA local (MediaPipe + Gemma 270M), voz reparada y Gemini auto-reparable.
+
+            Pasos:
+            1. Instala el APK en tu celular.
+            2. Abre la app y sigue `wayfix/GUIA_IA_LOCAL.md` para descargar el modelo (~320 MB).
+            3. Prueba con PROBAR VOZ y DIAGNÓSTICO.
+          files: wayfix/app/build/outputs/apk/debug/*.apk
+          prerelease: true
