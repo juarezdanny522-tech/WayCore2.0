@@ -24,13 +24,15 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android packages
+      - name: Ensure Android packages
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          SDK="${ANDROID_HOME:-$ANDROID_SDK_ROOT}"
+          if [ -z "$SDK" ]; then SDK=/usr/local/lib/android/sdk; fi
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          ls "$SDK/cmdline-tools"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
+          "$SDK/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -44,12 +46,13 @@ jobs:
       - name: Install Gradle 8.11.1
         run: |
           curl -sL https://services.gradle.org/distributions/gradle-8.11.1-bin.zip -o /tmp/gradle.zip
-          sudo unzip -q /tmp/gradle.zip -d /opt
-          /opt/gradle-8.11.1/bin/gradle --version
+          rm -rf "$HOME/gradle-8.11.1"
+          unzip -q /tmp/gradle.zip -d "$HOME"
+          echo "$HOME/gradle-8.11.1/bin" >> "$GITHUB_PATH"
 
       - name: Build debug APK
         working-directory: wayfix
-        run: /opt/gradle-8.11.1/bin/gradle :app:assembleDebug --no-daemon --stacktrace "-PGEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}"
+        run: gradle :app:assembleDebug --no-daemon --stacktrace "-PGEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
