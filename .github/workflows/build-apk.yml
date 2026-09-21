@@ -52,7 +52,17 @@ jobs:
 
       - name: Build debug APK
         working-directory: wayfix
-        run: gradle :app:assembleDebug --no-daemon --stacktrace "-PGEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}"
+        run: |
+          set -o pipefail
+          gradle :app:assembleDebug --no-daemon --stacktrace "-PGEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" 2>&1 | tee ../build.log
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: warn
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
